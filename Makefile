@@ -12,11 +12,12 @@ $(TARGET): src/main.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
+# Blocks until one TCP client connects; see README for second-terminal command.
 run: $(TARGET)
-	./$(TARGET)
+	./$(TARGET) 9090
 
 test: $(TARGET)
-	bash tests/test_socket.sh
+	python3 tests/test_listener.py
 
 clean:
 	rm -rf build
