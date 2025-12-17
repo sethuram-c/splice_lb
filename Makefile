@@ -3,21 +3,27 @@ CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Werror
 CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS ?=
-TARGET := build/splice-lb
+SERVER := build/splice-lb
+CLIENT := build/backend-client
 
 .PHONY: all clean test run
-all: $(TARGET)
+all: $(SERVER) $(CLIENT)
 
-$(TARGET): src/main.c
+$(SERVER): src/main.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
-# Blocks until one TCP client connects; see README for second-terminal command.
-run: $(TARGET)
-	./$(TARGET) 9090
+$(CLIENT): src/backend_client.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
-test: $(TARGET)
+# Blocks until one client connects and then closes after echoing to EOF.
+run: $(SERVER)
+	./$(SERVER) 9090
+
+test: all
 	python3 tests/test_listener.py
+	python3 tests/test_echo.py
 
 clean:
 	rm -rf build

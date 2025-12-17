@@ -11,4 +11,11 @@
   - [x] Report connecting client's address and close both descriptors
   - [x] Validate CLI port input, occupied port errors, and normal operation
   - [x] Automated real-socket tests via `make test`
-- [ ] Phase 3 - TCP echo and backend client
+- [x] Phase 3 - TCP echo and backend client
+  - [x] Echo arbitrary byte payloads until TCP write-side EOF
+  - [x] Handle interrupted syscalls and partial sends
+  - [x] Use `MSG_NOSIGNAL` to avoid socket-send SIGPIPE termination
+  - [x] Add a separate IPv4 backend client with `connect()` and half-close
+  - [x] Verify empty, text, binary and 128 KiB messages end to end
+  - [x] Preserve and rerun the Phase 2 listener regression suite
+- [ ] Phase 4 - First blocking proxy and resource cleanup

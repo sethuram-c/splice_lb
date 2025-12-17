@@ -13,6 +13,7 @@
 
 #define DEFAULT_PORT 9090U
 #define LISTEN_BACKLOG 16
+#define ECHO_BUFFER_SIZE 4096U
 
 static bool parse_port(const char *text, uint16_t *port) {
     if (text == NULL || *text == '\0') {
@@ -36,6 +37,42 @@ static bool parse_port(const char *text, uint16_t *port) {
 
 static void report_error(const char *operation) {
     fprintf(stderr, "%s failed: %s\n", operation, strerror(errno));
+}
+
+/* Echo arbitrary bytes; TCP does not preserve send()/recv() boundaries. */
+static bool echo_until_eof(int client) {
+    unsigned char buffer[ECHO_BUFFER_SIZE];
+    for (;;) {
+        ssize_t received = recv(client, buffer, sizeof(buffer), 0);
+        if (received == 0) {
+            return true;  /* Peer has finished its write direction. */
+        }
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            report_error("recv()");
+            return false;
+        }
+
+        size_t sent = 0;
+        while (sent < (size_t)received) {
+            ssize_t n = send(client, buffer + sent, (size_t)received - sent,
+                             MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                report_error("send()");
+                return false;
+            }
+            if (n == 0) {
+                fputs("send() returned zero without progress\n", stderr);
+                return false;
+            }
+            sent += (size_t)n;
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -73,14 +110,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Port 0 asks the OS to choose a free ephemeral listening port. */
     socklen_t address_len = sizeof(address);
     if (getsockname(listener, (struct sockaddr *)&address, &address_len) < 0) {
         report_error("getsockname()");
         goto cleanup;
     }
     printf("Listening on 127.0.0.1:%u\n", (unsigned)ntohs(address.sin_port));
-    fflush(stdout);  /* Let test clients discover the chosen port before accept(). */
+    fflush(stdout);  /* Automated tests discover the ephemeral port from this line. */
 
     struct sockaddr_in peer = {0};
     socklen_t peer_len = sizeof(peer);
@@ -99,6 +135,11 @@ int main(int argc, char **argv) {
     }
     printf("Accepted client %s:%u (fd=%d)\n", peer_ip,
            (unsigned)ntohs(peer.sin_port), client);
+    fflush(stdout);
+
+    if (!echo_until_eof(client)) {
+        goto cleanup;
+    }
     result = EXIT_SUCCESS;
 
 cleanup:
