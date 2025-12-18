@@ -2,106 +2,167 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define DEFAULT_PORT 9090U
 #define LISTEN_BACKLOG 16
-#define ECHO_BUFFER_SIZE 4096U
+#define COPY_BUFFER_SIZE 8192U
 
-static bool parse_port(const char *text, uint16_t *port) {
+static bool parse_port(const char *text, bool allow_zero, uint16_t *port) {
     if (text == NULL || *text == '\0') {
         return false;
     }
-    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
         if (*p < '0' || *p > '9') {
             return false;
         }
     }
-
     errno = 0;
     char *end = NULL;
     unsigned long value = strtoul(text, &end, 10);
-    if (errno != 0 || *end != '\0' || value > UINT16_MAX) {
+    if (errno != 0 || *end != '\0' || value > UINT16_MAX ||
+        (!allow_zero && value == 0)) {
         return false;
     }
     *port = (uint16_t)value;
     return true;
 }
 
-static void report_error(const char *operation) {
-    fprintf(stderr, "%s failed: %s\n", operation, strerror(errno));
+static void report_error(const char *call) {
+    fprintf(stderr, "%s failed: %s\n", call, strerror(errno));
 }
 
-/* Echo arbitrary bytes; TCP does not preserve send()/recv() boundaries. */
-static bool echo_until_eof(int client) {
-    unsigned char buffer[ECHO_BUFFER_SIZE];
-    for (;;) {
-        ssize_t received = recv(client, buffer, sizeof(buffer), 0);
-        if (received == 0) {
-            return true;  /* Peer has finished its write direction. */
-        }
-        if (received < 0) {
+static bool write_all(int destination, const unsigned char *data, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t sent = send(destination, data + offset, length - offset,
+                            MSG_NOSIGNAL);
+        if (sent < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            report_error("recv()");
+            report_error("send()");
             return false;
         }
+        if (sent == 0) {
+            fputs("send() returned zero without progress\n", stderr);
+            return false;
+        }
+        offset += (size_t)sent;
+    }
+    return true;
+}
 
-        size_t sent = 0;
-        while (sent < (size_t)received) {
-            ssize_t n = send(client, buffer + sent, (size_t)received - sent,
-                             MSG_NOSIGNAL);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                report_error("send()");
-                return false;
+/* A single blocking send_all() can stall both directions: fixed in Phase 5+. */
+static bool forward_once(int source, int destination, bool *source_open,
+                         uint64_t *byte_count) {
+    unsigned char buffer[COPY_BUFFER_SIZE];
+    ssize_t count;
+    do {
+        count = recv(source, buffer, sizeof(buffer), 0);
+    } while (count < 0 && errno == EINTR);
+
+    if (count < 0) {
+        report_error("recv()");
+        return false;
+    }
+    if (count == 0) {
+        /* EOF is one-way. Deliver FIN only after previously forwarded bytes. */
+        *source_open = false;
+        if (shutdown(destination, SHUT_WR) < 0) {
+            report_error("shutdown(SHUT_WR)");
+            return false;
+        }
+        return true;
+    }
+    if (!write_all(destination, buffer, (size_t)count)) {
+        return false;
+    }
+    *byte_count += (uint64_t)count;
+    return true;
+}
+
+static bool relay_bidirectional(int client, int backend,
+                                uint64_t *to_backend, uint64_t *to_client) {
+    bool client_read_open = true;
+    bool backend_read_open = true;
+    if (client >= FD_SETSIZE || backend >= FD_SETSIZE) {
+        fputs("socket descriptor exceeds select() FD_SETSIZE\n", stderr);
+        return false;
+    }
+
+    while (client_read_open || backend_read_open) {
+        fd_set read_ready;
+        FD_ZERO(&read_ready);
+        if (client_read_open) {
+            FD_SET(client, &read_ready);
+        }
+        if (backend_read_open) {
+            FD_SET(backend, &read_ready);
+        }
+        int highest = client > backend ? client : backend;
+        int ready = select(highest + 1, &read_ready, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
             }
-            if (n == 0) {
-                fputs("send() returned zero without progress\n", stderr);
-                return false;
-            }
-            sent += (size_t)n;
+            report_error("select()");
+            return false;
+        }
+        if (client_read_open && FD_ISSET(client, &read_ready) &&
+            !forward_once(client, backend, &client_read_open, to_backend)) {
+            return false;
+        }
+        if (backend_read_open && FD_ISSET(backend, &read_ready) &&
+            !forward_once(backend, client, &backend_read_open, to_client)) {
+            return false;
         }
     }
+    return true;
 }
 
 int main(int argc, char **argv) {
-    uint16_t port = DEFAULT_PORT;
-    if (argc > 2 || (argc == 2 && !parse_port(argv[1], &port))) {
-        fprintf(stderr, "Usage: %s [port: 0-65535]\n", argv[0]);
+    uint16_t listen_port;
+    uint16_t backend_port;
+    struct sockaddr_in backend_address = {0};
+    if (argc != 4 || !parse_port(argv[1], true, &listen_port) ||
+        !parse_port(argv[3], false, &backend_port) ||
+        inet_pton(AF_INET, argv[2], &backend_address.sin_addr) != 1) {
+        fprintf(stderr, "Usage: %s <listen-port: 0-65535> <backend-IPv4> "
+                        "<backend-port: 1-65535>\n", argv[0]);
         return EXIT_FAILURE;
     }
+    backend_address.sin_family = AF_INET;
+    backend_address.sin_port = htons(backend_port);
 
-    int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener < 0) {
-        report_error("socket()");
-        return EXIT_FAILURE;
-    }
-
-    int result = EXIT_FAILURE;
+    int listener = -1;
     int client = -1;
+    int backend = -1;
+    int result = EXIT_FAILURE;
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) {
+        report_error("socket(listener)");
+        goto cleanup;
+    }
     const int reuse = 1;
     if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         report_error("setsockopt(SO_REUSEADDR)");
         goto cleanup;
     }
-
-    struct sockaddr_in address = {0};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(listener, (const struct sockaddr *)&address, sizeof(address)) < 0) {
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = htons(listen_port);
+    if (bind(listener, (const struct sockaddr *)&local, sizeof(local)) < 0) {
         report_error("bind()");
         goto cleanup;
     }
@@ -109,50 +170,74 @@ int main(int argc, char **argv) {
         report_error("listen()");
         goto cleanup;
     }
-
-    socklen_t address_len = sizeof(address);
-    if (getsockname(listener, (struct sockaddr *)&address, &address_len) < 0) {
+    socklen_t local_size = sizeof(local);
+    if (getsockname(listener, (struct sockaddr *)&local, &local_size) < 0) {
         report_error("getsockname()");
         goto cleanup;
     }
-    printf("Listening on 127.0.0.1:%u\n", (unsigned)ntohs(address.sin_port));
-    fflush(stdout);  /* Automated tests discover the ephemeral port from this line. */
+    printf("Listening on 127.0.0.1:%u -> %s:%u\n",
+           (unsigned)ntohs(local.sin_port), argv[2], (unsigned)backend_port);
+    fflush(stdout);
 
-    struct sockaddr_in peer = {0};
-    socklen_t peer_len = sizeof(peer);
+    struct sockaddr_in remote_client = {0};
+    socklen_t remote_size = sizeof(remote_client);
     do {
-        client = accept(listener, (struct sockaddr *)&peer, &peer_len);
+        client = accept(listener, (struct sockaddr *)&remote_client, &remote_size);
     } while (client < 0 && errno == EINTR);
     if (client < 0) {
         report_error("accept()");
         goto cleanup;
     }
-
-    char peer_ip[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+    char ip_text[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &remote_client.sin_addr,
+                  ip_text, sizeof(ip_text)) == NULL) {
         report_error("inet_ntop()");
         goto cleanup;
     }
-    printf("Accepted client %s:%u (fd=%d)\n", peer_ip,
-           (unsigned)ntohs(peer.sin_port), client);
+    printf("Accepted client %s:%u (fd=%d)\n", ip_text,
+           (unsigned)ntohs(remote_client.sin_port), client);
     fflush(stdout);
 
-    if (!echo_until_eof(client)) {
+    backend = socket(AF_INET, SOCK_STREAM, 0);
+    if (backend < 0) {
+        report_error("socket(backend)");
         goto cleanup;
     }
+    /* An interrupted connect may still be in progress; do not blindly retry.
+       Phase 7 will manage EINPROGRESS / SO_ERROR using nonblocking I/O. */
+    if (connect(backend, (const struct sockaddr *)&backend_address,
+                sizeof(backend_address)) < 0) {
+        report_error("connect(backend)");
+        goto cleanup;
+    }
+    puts("Connected to backend");
+    fflush(stdout);
+
+    uint64_t to_backend = 0;
+    uint64_t to_client = 0;
+    if (!relay_bidirectional(client, backend, &to_backend, &to_client)) {
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+    printf("Forwarded client-to-backend=%" PRIu64 " bytes, "
+           "backend-to-client=%" PRIu64 " bytes\n", to_backend, to_client);
     result = EXIT_SUCCESS;
 
 cleanup:
+    if (backend >= 0 && close(backend) < 0) {
+        report_error("close(backend)");
+        result = EXIT_FAILURE;
+    }
     if (client >= 0 && close(client) < 0) {
         report_error("close(client)");
         result = EXIT_FAILURE;
     }
-    if (close(listener) < 0) {
+    if (listener >= 0 && close(listener) < 0) {
         report_error("close(listener)");
         result = EXIT_FAILURE;
     }
     if (result == EXIT_SUCCESS) {
-        puts("Closed client and listening sockets");
+        puts("Closed client, backend, and listening sockets");
     }
     return result;
 }

@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "build" / "splice-lb"
+SERVER = ROOT / "build" / "echo-backend"
 CLIENT = ROOT / "build" / "backend-client"
 TIMEOUT = 5
 

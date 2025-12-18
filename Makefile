@@ -5,9 +5,10 @@ LDFLAGS ?=
 LDLIBS ?=
 SERVER := build/splice-lb
 CLIENT := build/backend-client
+ECHO := build/echo-backend
 
 .PHONY: all clean test run
-all: $(SERVER) $(CLIENT)
+all: $(SERVER) $(CLIENT) $(ECHO)
 
 $(SERVER): src/main.c
 	@mkdir -p build
@@ -17,13 +18,23 @@ $(CLIENT): src/backend_client.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
-# Blocks until one client connects and then closes after echoing to EOF.
+$(ECHO): src/echo_backend.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+
+# Terminal A: make backend (or ./build/echo-backend 9091)
+# Terminal B: make run
+.PHONY: backend
+backend: $(ECHO)
+	./$(ECHO) 9091
+
 run: $(SERVER)
-	./$(SERVER) 9090
+	./$(SERVER) 9090 127.0.0.1 9091
 
 test: all
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
+	python3 tests/test_proxy.py
 
 clean:
 	rm -rf build

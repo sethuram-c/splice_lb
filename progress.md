@@ -18,4 +18,12 @@
   - [x] Add a separate IPv4 backend client with `connect()` and half-close
   - [x] Verify empty, text, binary and 128 KiB messages end to end
   - [x] Preserve and rerun the Phase 2 listener regression suite
-- [ ] Phase 4 - First blocking proxy and resource cleanup
+- [x] Phase 4 - First blocking proxy and resource cleanup
+  - [x] Preserve previous echo program as `build/echo-backend`
+  - [x] Add client -> proxy -> backend -> proxy -> client forwarding
+  - [x] Use `select()` for bidirectional read readiness with blocking sockets
+  - [x] Implement send loops and propagate EOF with `shutdown(SHUT_WR)`
+  - [x] Centralize socket cleanup after success or setup errors
+  - [x] Test binary integrity, 256 KiB, half-closes, backend-first traffic
+  - [x] Verify refused backend and invalid arguments; retain Phases 2-3 tests
+- [ ] Phase 5 - Nonblocking sockets and `epoll` setup
