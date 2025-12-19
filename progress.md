@@ -26,4 +26,12 @@
   - [x] Centralize socket cleanup after success or setup errors
   - [x] Test binary integrity, 256 KiB, half-closes, backend-first traffic
   - [x] Verify refused backend and invalid arguments; retain Phases 2-3 tests
-- [ ] Phase 5 - Nonblocking sockets and `epoll` setup
+- [x] Phase 5 - Nonblocking sockets and `epoll` setup
+  - [x] Set `O_NONBLOCK` on listener, accepted client, and connected backend
+  - [x] Create `epoll` instance and register the listener for `EPOLLIN`
+  - [x] Use level-triggered `epoll_wait()` to drive one-client bidirectional relay
+  - [x] Buffer partial nonblocking writes and arm `EPOLLOUT` on demand
+  - [x] Preserve TCP half-closes and forward buffered bytes before FIN
+  - [x] Inspect `/proc/<pid>/fdinfo` to confirm epoll watches and nonblocking flags
+  - [x] Re-run Phase 2-4 tests; verify 1 MiB binary payload integrity
+- [ ] Phase 6 - Accept multiple clients and track connections

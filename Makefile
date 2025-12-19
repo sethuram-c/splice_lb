@@ -35,6 +35,7 @@ test: all
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
+	python3 tests/test_epoll.py
 
 clean:
 	rm -rf build
