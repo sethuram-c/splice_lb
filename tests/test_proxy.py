@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Phase 4 blocking TCP proxy integration tests, Python standard library only."""
+"""Phase 4 forwarding regression checks adapted for Phase 6 persistent proxy."""
 
 from __future__ import annotations
 
 import re
+import os
+import time
 import selectors
 import socket
 import subprocess
@@ -45,13 +47,32 @@ def stop_proxy(proc: subprocess.Popen[bytes]) -> None:
     proc.communicate(timeout=TIMEOUT)
 
 
+def wait_for_proxy_cleanup(proc: subprocess.Popen[bytes]) -> None:
+    """Wait until only the listener remains; avoids racing log assertions."""
+    deadline = time.monotonic() + TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            targets = [os.readlink(entry) for entry in
+                       (Path("/proc") / str(proc.pid) / "fd").iterdir()]
+        except (FileNotFoundError, ProcessLookupError):
+            break
+        if sum(target.startswith("socket:[") for target in targets) == 1:
+            return
+        time.sleep(0.01)
+    raise AssertionError("proxy did not finish and release its session sockets")
+
+
 def completed_proxy(proc: subprocess.Popen[bytes], forward: int, backward: int) -> None:
+    # Phase 6 keeps listening after a completed session; terminate only the
+    # test process, then verify that its per-connection accounting was printed.
+    wait_for_proxy_cleanup(proc)
+    assert proc.poll() is None, "proxy unexpectedly exited after client"
+    proc.terminate()
     out, err = proc.communicate(timeout=TIMEOUT)
-    assert proc.returncode == 0, (proc.returncode, err.decode(errors="replace"))
+    assert proc.returncode == -15, (proc.returncode, err.decode(errors="replace"))
     assert b"Connected to backend" in out, out
-    assert (f"Forwarded client-to-backend={forward} bytes, "
-            f"backend-to-client={backward} bytes").encode() in out, out
-    assert b"Closed client, backend, and listening sockets" in out, out
+    assert (f"Closed connection: client-to-backend={forward} bytes, "
+            f"backend-to-client={backward} bytes; active=0").encode() in out, out
 
 
 def run_backend(handler: Callable[[socket.socket], None],
@@ -197,25 +218,22 @@ def check_backend_refusal() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
         reservation.bind(("127.0.0.1", 0))
         refused_port = reservation.getsockname()[1]
-        # Bind without listening: Linux rejects connections to this address.
         proc, proxy_port = start_proxy(refused_port)
         try:
-            with socket.create_connection(("127.0.0.1", proxy_port), timeout=TIMEOUT):
-                pass
-            output, error = proc.communicate(timeout=TIMEOUT)
-            assert proc.returncode != 0, output
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=TIMEOUT) as conn:
+                conn.settimeout(TIMEOUT)
+                assert conn.recv(1) == b"", "refused backend should close the client"
+            # A failed backend is isolated; the persistent listener survives.
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=TIMEOUT) as conn:
+                conn.settimeout(TIMEOUT)
+                assert conn.recv(1) == b""
+            assert proc.poll() is None, "failed backend killed the entire proxy"
+            proc.terminate()
+            _, error = proc.communicate(timeout=TIMEOUT)
             assert b"connect(backend) failed:" in error, error
-            with socket.socket() as retry:
-                retry.settimeout(0.5)
-                try:
-                    retry.connect(("127.0.0.1", proxy_port))
-                except ConnectionRefusedError:
-                    pass
-                else:
-                    raise AssertionError("proxy listener leaked after refused backend")
         finally:
             stop_proxy(proc)
-    print("PASS: failed backend connection exits nonzero and closes listener")
+    print("PASS: refused backend affects only its client; listener survives")
 
 
 def check_arguments() -> None:
@@ -240,7 +258,7 @@ def main() -> None:
     check_backend_half_close_first()
     check_backend_client()
     check_backend_refusal()
-    print("PASS: Phase 4 blocking proxy and resource cleanup test suite")
+    print("PASS: Phase 4 proxy forwarding regression suite (Phase 6 persistent mode)")
 
 
 if __name__ == "__main__":

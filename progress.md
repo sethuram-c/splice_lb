@@ -34,4 +34,13 @@
   - [x] Preserve TCP half-closes and forward buffered bytes before FIN
   - [x] Inspect `/proc/<pid>/fdinfo` to confirm epoll watches and nonblocking flags
   - [x] Re-run Phase 2-4 tests; verify 1 MiB binary payload integrity
-- [ ] Phase 6 - Accept multiple clients and track connections
+- [x] Phase 6 - Accept multiple clients and track connections
+  - [x] Preserve the epoll listener and drain accept() until EAGAIN
+  - [x] Give each accepted client a connection object and two relay buffers
+  - [x] Route epoll readiness using a dynamically grown fd table
+  - [x] Tag epoll events with descriptor generations to ignore stale events
+  - [x] Finish, count, and close one session without terminating other clients
+  - [x] Keep listener alive when an individual backend connect() fails
+  - [x] Verify two concurrent clients, 48 overlapping requests, 24 reconnects
+  - [x] Rerun prior listener, echo, proxy, and epoll regression tests
+- [ ] Phase 7 - Client events and nonblocking backend connections

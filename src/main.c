@@ -14,10 +14,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define LISTEN_BACKLOG 16
+#define LISTEN_BACKLOG 128
 #define COPY_BUFFER_SIZE 8192U
-#define EVENT_BATCH 4
+#define EVENT_BATCH 64
 
+struct connection;
+struct endpoint {
+    int fd;
+    uint32_t interest;
+    uint64_t token;
+    bool is_client;
+    struct connection *owner;
+};
 struct direction {
     int source;
     int destination;
@@ -28,21 +36,33 @@ struct direction {
     bool source_eof;
     bool destination_shutdown;
 };
+struct connection {
+    struct connection *next;
+    struct endpoint client;
+    struct endpoint backend;
+    struct direction to_backend;
+    struct direction to_client;
+};
+struct server {
+    int listener;
+    int epoll_fd;
+    struct sockaddr_in backend_address;
+    struct connection *connections;
+    struct endpoint **by_fd;
+    size_t fd_capacity;
+    uint32_t next_generation;
+    size_t active;
+};
 
 static bool parse_port(const char *text, bool allow_zero, uint16_t *port) {
-    if (text == NULL || *text == '\0') {
-        return false;
-    }
+    if (text == NULL || *text == '\0') return false;
     for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-        if (*p < '0' || *p > '9') {
-            return false;
-        }
+        if (*p < '0' || *p > '9') return false;
     }
     errno = 0;
     char *end = NULL;
     unsigned long value = strtoul(text, &end, 10);
-    if (errno != 0 || *end != '\0' || value > UINT16_MAX ||
-        (!allow_zero && value == 0)) {
+    if (errno || *end != '\0' || value > UINT16_MAX || (!allow_zero && value == 0)) {
         return false;
     }
     *port = (uint16_t)value;
@@ -53,7 +73,6 @@ static void report_error(const char *call) {
     fprintf(stderr, "%s failed: %s\n", call, strerror(errno));
 }
 
-/* Keep existing descriptor flags: fcntl(F_SETFL) must not overwrite them. */
 static bool set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
@@ -63,77 +82,88 @@ static bool set_nonblocking(int fd) {
     return true;
 }
 
-static bool add_interest(int epoll_fd, int fd, uint32_t events) {
-    struct epoll_event event = {.events = events, .data.fd = fd};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+/* Store a generation with each fd.  An old event cannot be mistaken for a
+ * newly accepted connection if Linux reuses a recently closed fd. */
+static bool ensure_slot(struct server *server, int fd) {
+    if (fd < 0) return false;
+    if ((size_t)fd < server->fd_capacity) return true;
+    size_t size = server->fd_capacity ? server->fd_capacity : 64;
+    while (size <= (size_t)fd) {
+        if (size > SIZE_MAX / 2) return false;
+        size *= 2;
+    }
+    if (size > SIZE_MAX / sizeof(*server->by_fd)) return false;
+    struct endpoint **next = realloc(server->by_fd, size * sizeof(*next));
+    if (next == NULL) {
+        report_error("realloc(fd lookup)");
+        return false;
+    }
+    memset(next + server->fd_capacity, 0,
+           (size - server->fd_capacity) * sizeof(*next));
+    server->by_fd = next;
+    server->fd_capacity = size;
+    return true;
+}
+
+static bool register_endpoint(struct server *server, struct endpoint *endpoint,
+                              uint32_t interest) {
+    if (!ensure_slot(server, endpoint->fd)) return false;
+    uint32_t generation = ++server->next_generation;
+    if (generation == 0) generation = ++server->next_generation;
+    endpoint->token = ((uint64_t)generation << 32) | (uint32_t)endpoint->fd;
+    struct epoll_event event = {.events = interest, .data.u64 = endpoint->token};
+    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, endpoint->fd, &event) < 0) {
         report_error("epoll_ctl(ADD)");
         return false;
     }
+    endpoint->interest = interest;
+    server->by_fd[endpoint->fd] = endpoint;
     return true;
 }
 
-static bool modify_interest(int epoll_fd, int fd, uint32_t events) {
-    struct epoll_event event = {.events = events, .data.fd = fd};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+static bool change_interest(struct server *server, struct endpoint *endpoint,
+                            uint32_t interest) {
+    if (endpoint->interest == interest) return true;
+    struct epoll_event event = {.events = interest, .data.u64 = endpoint->token};
+    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_MOD, endpoint->fd, &event) < 0) {
         report_error("epoll_ctl(MOD)");
         return false;
     }
+    endpoint->interest = interest;
     return true;
 }
 
-/* A readable, nonblocking listener can still return EAGAIN: this is normal. */
-static int accept_single_client(int epoll_fd, int listener) {
-    struct epoll_event events[EVENT_BATCH];
-    for (;;) {
-        int ready = epoll_wait(epoll_fd, events, EVENT_BATCH, -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            report_error("epoll_wait(listener)");
-            return -1;
-        }
-        for (int i = 0; i < ready; ++i) {
-            if (events[i].data.fd != listener) {
-                continue;
-            }
-            if (events[i].events & EPOLLERR) {
-                fputs("listener reported EPOLLERR\n", stderr);
-                return -1;
-            }
-            struct sockaddr_in remote = {0};
-            socklen_t length = sizeof(remote);
-            int client;
-            do {
-                client = accept(listener, (struct sockaddr *)&remote, &length);
-            } while (client < 0 && errno == EINTR);
-            if (client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                continue;
-            }
-            if (client < 0) {
-                report_error("accept()");
-                return -1;
-            }
-            char text[INET_ADDRSTRLEN];
-            if (inet_ntop(AF_INET, &remote.sin_addr, text, sizeof(text)) == NULL) {
-                report_error("inet_ntop()");
-                close(client);
-                return -1;
-            }
-            printf("Accepted client %s:%u (fd=%d)\n", text,
-                   (unsigned)ntohs(remote.sin_port), client);
-            fflush(stdout);
-            return client;
+static void release_endpoint(struct server *server, struct endpoint *endpoint) {
+    if (endpoint->fd < 0) return;
+    if ((size_t)endpoint->fd < server->fd_capacity &&
+        server->by_fd[endpoint->fd] == endpoint) {
+        server->by_fd[endpoint->fd] = NULL;
+        if (epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, endpoint->fd, NULL) < 0) {
+            report_error("epoll_ctl(DEL)");
         }
     }
+    if (close(endpoint->fd) < 0) report_error("close(endpoint)");
+    endpoint->fd = -1;
 }
 
-/* A FIN can be relayed only after any buffered bytes are sent. */
+static void remove_connection(struct server *server, struct connection *connection) {
+    struct connection **cursor = &server->connections;
+    while (*cursor != NULL && *cursor != connection) cursor = &(*cursor)->next;
+    if (*cursor == connection) *cursor = connection->next;
+    release_endpoint(server, &connection->client);
+    release_endpoint(server, &connection->backend);
+    if (server->active > 0) --server->active;
+    printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
+           "backend-to-client=%" PRIu64 " bytes; active=%zu\n",
+           connection->to_backend.forwarded, connection->to_client.forwarded,
+           server->active);
+    fflush(stdout);
+    free(connection);
+}
+
 static bool finish_direction(struct direction *direction) {
     if (!direction->source_eof || direction->pending != 0 ||
-        direction->destination_shutdown) {
-        return true;
-    }
+        direction->destination_shutdown) return true;
     if (shutdown(direction->destination, SHUT_WR) < 0) {
         report_error("shutdown(SHUT_WR)");
         return false;
@@ -143,7 +173,7 @@ static bool finish_direction(struct direction *direction) {
 }
 
 static bool flush_direction(struct direction *direction) {
-    while (direction->pending != 0) {
+    while (direction->pending > 0) {
         ssize_t written = send(direction->destination,
                                direction->buffer + direction->offset,
                                direction->pending, MSG_NOSIGNAL);
@@ -151,244 +181,202 @@ static bool flush_direction(struct direction *direction) {
             direction->offset += (size_t)written;
             direction->pending -= (size_t)written;
             direction->forwarded += (uint64_t)written;
+        } else if (written < 0 && errno == EINTR) {
             continue;
-        }
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return true; /* Keep pending bytes; epoll will notify writability. */
-        }
-        if (written == 0) {
-            fputs("send() made no progress\n", stderr);
+        } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return true;
         } else {
-            report_error("send()");
+            if (written == 0) fputs("send() made no progress\n", stderr);
+            else report_error("send()");
+            return false;
         }
-        return false;
     }
     direction->offset = 0;
     return finish_direction(direction);
 }
 
-/* Read at most one buffer: never overwrite data queued for the destination. */
 static bool read_direction(struct direction *direction) {
-    if (direction->source_eof || direction->pending != 0) {
-        return true;
-    }
+    if (direction->source_eof || direction->pending != 0) return true;
     for (;;) {
-        ssize_t count = recv(direction->source, direction->buffer,
-                             sizeof(direction->buffer), 0);
-        if (count > 0) {
+        ssize_t got = recv(direction->source, direction->buffer,
+                           sizeof(direction->buffer), 0);
+        if (got > 0) {
             direction->offset = 0;
-            direction->pending = (size_t)count;
+            direction->pending = (size_t)got;
             return flush_direction(direction);
         }
-        if (count == 0) {
+        if (got == 0) {
             direction->source_eof = true;
             return finish_direction(direction);
         }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return true;
-        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
         report_error("recv()");
         return false;
     }
 }
 
-/* Level-triggered epoll; EPOLLOUT is armed only while a write is pending. */
-static bool update_interests(int epoll_fd, int client, int backend,
-                             const struct direction *to_backend,
-                             const struct direction *to_client) {
-    uint32_t client_events = 0;
-    uint32_t backend_events = 0;
-    if (!to_backend->source_eof && to_backend->pending == 0) {
-        client_events |= EPOLLIN;
-    }
-    if (!to_client->source_eof && to_client->pending == 0) {
-        backend_events |= EPOLLIN;
-    }
-    if (to_client->pending != 0) {
-        client_events |= EPOLLOUT;
-    }
-    if (to_backend->pending != 0) {
-        backend_events |= EPOLLOUT;
-    }
-    return modify_interest(epoll_fd, client, client_events) &&
-           modify_interest(epoll_fd, backend, backend_events);
+static bool update_interests(struct server *server, struct connection *connection) {
+    uint32_t client_mask = 0, backend_mask = 0;
+    if (!connection->to_backend.source_eof && connection->to_backend.pending == 0)
+        client_mask |= EPOLLIN;
+    if (!connection->to_client.source_eof && connection->to_client.pending == 0)
+        backend_mask |= EPOLLIN;
+    if (connection->to_client.pending > 0) client_mask |= EPOLLOUT;
+    if (connection->to_backend.pending > 0) backend_mask |= EPOLLOUT;
+    return change_interest(server, &connection->client, client_mask) &&
+           change_interest(server, &connection->backend, backend_mask);
 }
 
-static bool relay_bidirectional(int epoll_fd, int client, int backend,
-                                uint64_t *to_backend, uint64_t *to_client) {
-    struct direction client_to_backend = {
-        .source = client, .destination = backend
-    };
-    struct direction backend_to_client = {
-        .source = backend, .destination = client
-    };
-    if (!add_interest(epoll_fd, client, EPOLLIN) ||
-        !add_interest(epoll_fd, backend, EPOLLIN)) {
+static bool attach_connection(struct server *server, int client) {
+    struct connection *connection = calloc(1, sizeof(*connection));
+    if (!connection) {
+        report_error("calloc(connection)");
+        close(client);
         return false;
     }
-    struct epoll_event events[EVENT_BATCH];
-    while (!client_to_backend.destination_shutdown ||
-           !backend_to_client.destination_shutdown) {
-        int ready = epoll_wait(epoll_fd, events, EVENT_BATCH, -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            report_error("epoll_wait(relay)");
-            return false;
-        }
-        for (int i = 0; i < ready; ++i) {
-            const int fd = events[i].data.fd;
-            const uint32_t flags = events[i].events;
-            if (fd != client && fd != backend) {
-                fputs("unexpected epoll fd\n", stderr);
-                return false;
-            }
-            struct direction *incoming = fd == client ?
-                                         &client_to_backend : &backend_to_client;
-            struct direction *outgoing = fd == client ?
-                                         &backend_to_client : &client_to_backend;
-            if ((flags & EPOLLOUT) && !flush_direction(outgoing)) {
-                return false;
-            }
-            /* EPOLLHUP and EPOLLERR require a read/response, not silent drop. */
-            if ((flags & (EPOLLIN | EPOLLHUP | EPOLLERR)) &&
-                !read_direction(incoming)) {
-                return false;
-            }
-        }
-        if (!update_interests(epoll_fd, client, backend,
-                              &client_to_backend, &backend_to_client)) {
-            return false;
-        }
+    connection->client.fd = client;
+    connection->backend.fd = -1;
+    connection->client.is_client = true;
+    connection->client.owner = connection;
+    connection->backend.owner = connection;
+    if (!set_nonblocking(client)) goto fail;
+    connection->backend.fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connection->backend.fd < 0) {
+        report_error("socket(backend)");
+        goto fail;
     }
-    *to_backend = client_to_backend.forwarded;
-    *to_client = backend_to_client.forwarded;
+    /* Still blocking until Phase 7's EINPROGRESS/SO_ERROR implementation. */
+    if (connect(connection->backend.fd, (const struct sockaddr *)&server->backend_address,
+                sizeof(server->backend_address)) < 0) {
+        report_error("connect(backend)");
+        goto fail;
+    }
+    if (!set_nonblocking(connection->backend.fd)) goto fail;
+    connection->to_backend.source = client;
+    connection->to_backend.destination = connection->backend.fd;
+    connection->to_client.source = connection->backend.fd;
+    connection->to_client.destination = client;
+    if (!register_endpoint(server, &connection->client, EPOLLIN) ||
+        !register_endpoint(server, &connection->backend, EPOLLIN)) goto fail;
+    connection->next = server->connections;
+    server->connections = connection;
+    ++server->active;
+    printf("Connected to backend; active=%zu\n", server->active);
+    fflush(stdout);
     return true;
+fail:
+    release_endpoint(server, &connection->client);
+    release_endpoint(server, &connection->backend);
+    free(connection);
+    return false;
+}
+
+static bool accept_ready(struct server *server) {
+    for (;;) {
+        struct sockaddr_in remote = {0};
+        socklen_t length = sizeof(remote);
+        int client = accept(server->listener, (struct sockaddr *)&remote, &length);
+        if (client < 0 && errno == EINTR) continue;
+        if (client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        if (client < 0) {
+            report_error("accept()");
+            return false;
+        }
+        /* A backend refusal is isolated to this client; the listener remains alive. */
+        (void)attach_connection(server, client);
+    }
+}
+
+static void dispatch_client_event(struct server *server, uint64_t token,
+                                  uint32_t flags) {
+    int fd = (int)(uint32_t)token;
+    if (fd < 0 || (size_t)fd >= server->fd_capacity) return;
+    struct endpoint *endpoint = server->by_fd[fd];
+    if (endpoint == NULL || endpoint->token != token) return; /* stale event */
+    struct connection *connection = endpoint->owner;
+    struct direction *incoming = endpoint->is_client ?
+                                 &connection->to_backend : &connection->to_client;
+    struct direction *outgoing = endpoint->is_client ?
+                                 &connection->to_client : &connection->to_backend;
+    bool ok = true;
+    if (flags & EPOLLOUT) ok = flush_direction(outgoing);
+    if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)))
+        ok = read_direction(incoming);
+    if (ok && incoming->destination_shutdown && outgoing->destination_shutdown) {
+        remove_connection(server, connection);
+        return;
+    }
+    if (!ok || !update_interests(server, connection))
+        remove_connection(server, connection);
+}
+
+static void cleanup_server(struct server *server) {
+    while (server->connections != NULL)
+        remove_connection(server, server->connections);
+    if (server->listener >= 0) close(server->listener);
+    if (server->epoll_fd >= 0) close(server->epoll_fd);
+    free(server->by_fd);
 }
 
 int main(int argc, char **argv) {
-    uint16_t listen_port;
-    uint16_t backend_port;
-    struct sockaddr_in backend_address = {0};
+    uint16_t listen_port, backend_port;
+    struct sockaddr_in backend = {0};
     if (argc != 4 || !parse_port(argv[1], true, &listen_port) ||
         !parse_port(argv[3], false, &backend_port) ||
-        inet_pton(AF_INET, argv[2], &backend_address.sin_addr) != 1) {
+        inet_pton(AF_INET, argv[2], &backend.sin_addr) != 1) {
         fprintf(stderr, "Usage: %s <listen-port: 0-65535> <backend-IPv4> "
                         "<backend-port: 1-65535>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    backend_address.sin_family = AF_INET;
-    backend_address.sin_port = htons(backend_port);
-
-    int listener = -1;
-    int client = -1;
-    int backend = -1;
-    int epoll_fd = -1;
+    backend.sin_family = AF_INET;
+    backend.sin_port = htons(backend_port);
+    struct server server = {.listener = -1, .epoll_fd = -1, .backend_address = backend};
     int result = EXIT_FAILURE;
-
-    listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener < 0) {
-        report_error("socket(listener)");
-        goto cleanup;
-    }
+    server.listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (server.listener < 0) { report_error("socket(listener)"); goto done; }
     const int reuse = 1;
-    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        report_error("setsockopt(SO_REUSEADDR)");
-        goto cleanup;
+    if (setsockopt(server.listener, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                   sizeof(reuse)) < 0) {
+        report_error("setsockopt(SO_REUSEADDR)"); goto done;
     }
-    if (!set_nonblocking(listener)) {
-        goto cleanup;
-    }
+    if (!set_nonblocking(server.listener)) goto done;
     struct sockaddr_in local = {0};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     local.sin_port = htons(listen_port);
-    if (bind(listener, (const struct sockaddr *)&local, sizeof(local)) < 0) {
-        report_error("bind()");
-        goto cleanup;
+    if (bind(server.listener, (const struct sockaddr *)&local, sizeof(local)) < 0) {
+        report_error("bind()"); goto done;
     }
-    if (listen(listener, LISTEN_BACKLOG) < 0) {
-        report_error("listen()");
-        goto cleanup;
+    if (listen(server.listener, LISTEN_BACKLOG) < 0) { report_error("listen()"); goto done; }
+    socklen_t size = sizeof(local);
+    if (getsockname(server.listener, (struct sockaddr *)&local, &size) < 0) {
+        report_error("getsockname()"); goto done;
     }
-    socklen_t local_size = sizeof(local);
-    if (getsockname(listener, (struct sockaddr *)&local, &local_size) < 0) {
-        report_error("getsockname()");
-        goto cleanup;
-    }
-    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd < 0) {
-        report_error("epoll_create1()");
-        goto cleanup;
-    }
-    if (!add_interest(epoll_fd, listener, EPOLLIN)) {
-        goto cleanup;
-    }
+    server.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (server.epoll_fd < 0) { report_error("epoll_create1()"); goto done; }
+    struct epoll_event listener_event = {.events = EPOLLIN, .data.u64 = 0};
+    if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, server.listener,
+                  &listener_event) < 0) { report_error("epoll_ctl(listener)"); goto done; }
     printf("Listening on 127.0.0.1:%u -> %s:%u\n",
            (unsigned)ntohs(local.sin_port), argv[2], (unsigned)backend_port);
     fflush(stdout);
 
-    client = accept_single_client(epoll_fd, listener);
-    if (client < 0 || !set_nonblocking(client)) {
-        goto cleanup;
+    struct epoll_event events[EVENT_BATCH];
+    for (;;) {
+        int ready = epoll_wait(server.epoll_fd, events, EVENT_BATCH, -1);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) { report_error("epoll_wait()"); break; }
+        for (int i = 0; i < ready; ++i) {
+            if (events[i].data.u64 == 0) {
+                if ((events[i].events & EPOLLERR) || !accept_ready(&server)) goto done;
+            } else {
+                dispatch_client_event(&server, events[i].data.u64, events[i].events);
+            }
+        }
     }
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listener, NULL) < 0) {
-        report_error("epoll_ctl(DEL listener)");
-        goto cleanup;
-    }
-    backend = socket(AF_INET, SOCK_STREAM, 0);
-    if (backend < 0) {
-        report_error("socket(backend)");
-        goto cleanup;
-    }
-    /* Still blocking at this stage; Phase 7 adds EINPROGRESS + SO_ERROR. */
-    if (connect(backend, (const struct sockaddr *)&backend_address,
-                sizeof(backend_address)) < 0) {
-        report_error("connect(backend)");
-        goto cleanup;
-    }
-    if (!set_nonblocking(backend)) {
-        goto cleanup;
-    }
-    puts("Connected to backend");
-    fflush(stdout);
 
-    uint64_t to_backend = 0;
-    uint64_t to_client = 0;
-    if (!relay_bidirectional(epoll_fd, client, backend,
-                             &to_backend, &to_client)) {
-        goto cleanup;
-    }
-    printf("Forwarded client-to-backend=%" PRIu64 " bytes, "
-           "backend-to-client=%" PRIu64 " bytes\n", to_backend, to_client);
-    result = EXIT_SUCCESS;
-
-cleanup:
-    if (epoll_fd >= 0 && close(epoll_fd) < 0) {
-        report_error("close(epoll)");
-        result = EXIT_FAILURE;
-    }
-    if (backend >= 0 && close(backend) < 0) {
-        report_error("close(backend)");
-        result = EXIT_FAILURE;
-    }
-    if (client >= 0 && close(client) < 0) {
-        report_error("close(client)");
-        result = EXIT_FAILURE;
-    }
-    if (listener >= 0 && close(listener) < 0) {
-        report_error("close(listener)");
-        result = EXIT_FAILURE;
-    }
-    if (result == EXIT_SUCCESS) {
-        puts("Closed client, backend, and listening sockets");
-    }
+done:
+    cleanup_server(&server);
     return result;
 }

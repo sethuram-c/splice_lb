@@ -28,6 +28,11 @@ $(ECHO): src/echo_backend.c
 backend: $(ECHO)
 	./$(ECHO) 9091
 
+backend-multi:
+	python3 tests/backend_multi.py 9091
+
+.PHONY: backend-multi
+
 run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
@@ -36,6 +41,7 @@ test: all
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
 	python3 tests/test_epoll.py
+	python3 tests/test_multiclient.py
 
 clean:
 	rm -rf build

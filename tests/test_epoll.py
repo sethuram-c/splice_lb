@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 5: Linux epoll + O_NONBLOCK introspection and relay regression."""
+"""Phase 5 epoll/O_NONBLOCK checks adapted for Phase 6 persistent relay."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from test_proxy import TIMEOUT, check_request_response, completed_proxy, recv_until_eof, start_proxy, stop_proxy
+from test_proxy import TIMEOUT, check_request_response, recv_until_eof, start_proxy, stop_proxy, wait_for_proxy_cleanup
 
 
 def kernel_descriptors(pid: int) -> tuple[list[int], list[int]]:
@@ -79,17 +79,20 @@ def check_epoll_registration_and_socket_flags() -> None:
                 while True:
                     sockets, epolls = kernel_descriptors(proc.pid)
                     if len(sockets) >= 3 and len(epolls) == 1 and \
-                            epoll_target_count(proc.pid, epolls[0]) >= 2:
+                            epoll_target_count(proc.pid, epolls[0]) >= 3:
                         break
                     if time.monotonic() > deadline:
                         raise AssertionError(("epoll registration timeout", sockets, epolls))
                     time.sleep(0.01)
                 assert all_nonblocking(proc.pid, sockets), "not all proxy sockets are nonblocking"
-                assert epoll_target_count(proc.pid, epolls[0]) == 2, "expected client+backend registered"
+                assert epoll_target_count(proc.pid, epolls[0]) == 3, "expected listener+client+backend registered"
                 release_backend.set()
                 assert recv_until_eof(client) == b"ACK:" + payload
+            wait_for_proxy_cleanup(proc)
+            assert proc.poll() is None, "proxy must remain active after a session"
+            proc.terminate()
             output, err = proc.communicate(timeout=TIMEOUT)
-            assert proc.returncode == 0, err.decode(errors="replace")
+            assert proc.returncode == -15, err.decode(errors="replace")
             assert b"Connected to backend" in output
             assert f"client-to-backend={len(payload)} bytes".encode() in output
             assert f"backend-to-client={len(payload) + 4} bytes".encode() in output
@@ -100,7 +103,7 @@ def check_epoll_registration_and_socket_flags() -> None:
         assert not worker.is_alive(), "backend worker still running"
         if errors:
             raise errors[0]
-    print("PASS: Linux eventpoll watches client+backend; all 3 sockets have O_NONBLOCK")
+    print("PASS: epoll watches listener+client+backend; all sockets have O_NONBLOCK")
 
 
 def main() -> None:
