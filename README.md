@@ -1,119 +1,134 @@
-# Splice Load Balancer - Phase 6
+# Splice Load Balancer - Phase 7
 
-This phase advances a Fedora/Linux C TCP proxy from **one session per execution** to
-**multiple simultaneously active client/backend pairs**, driven by one level-triggered
-`epoll` instance. The source remains an **8 KiB buffered copy relay**; `splice()` arrives
-in Phase 10. This is a learning implementation and currently listens on loopback only.
+Phase 7 makes outbound backend **connection establishment nonblocking**. The
+Phase 6 proxy already accepts multiple TCP clients using level-triggered
+`epoll`, but a blocking `connect()` inside its accept loop could stall every
+client. Now the backend socket has `O_NONBLOCK` **before** `connect()`, and a
+per-connection `BACKEND_CONNECTING` / `BACKEND_READY` state tracks completion.
 
-## Requirements (Fedora)
+Traffic is still forwarded using per-direction **8 KiB user-space buffers**.
+Zero-copy `splice()` starts in Phase 10. The listening interface remains
+`127.0.0.1` for safe local development.
+
+## Fedora requirements
 
 ```bash
 sudo dnf install gcc make python3 git unzip
-# Optional tools for Linux socket inspection:
+# Optional socket tracing and manual testing utilities:
 sudo dnf install iproute strace lsof nmap-ncat
 ```
 
-## Apply the Phase 6 patch to Phase 5
+The Linux-specific `LD_PRELOAD` observer used by the Phase 7 tests compiles a
+temporary shared object using the installed C compiler. It is **test-only**;
+it is never linked into the production proxy and is deleted afterward.
+
+## Apply the patch over Phase 6
 
 ```bash
 cd /path/to/splice-load-balancer
-unzip -o ~/Downloads/phase06_changes.zip -d .
+unzip -o ~/Downloads/phase07_changes.zip -d .
 make clean
 make
 make test
 ```
 
-Use the downloaded ZIP's actual path. It contains only added/modified files; don't
-remove previous phase source files. Expected final line:
+Expected last line:
 
 ```text
-PASS: Phase 6 multi-client connection tracking test suite
+PASS: Phase 7 nonblocking backend connection test suite
 ```
 
-The suite also executes previous listener, echo, relay, and epoll regression tests.
-`make test` uses the Python standard library and a locally bound threaded backend.
+Tests for Phases 2-6 also execute. The Phase 7 tests prove that `O_NONBLOCK`
+was set at the exact outbound `connect()` invocation (through a test-only
+`LD_PRELOAD` interceptor), send 36 early client payloads concurrently, verify
+byte integrity, and check that eight rejected backend connections do not kill
+the listening socket.
 
-## Manual demonstration: keep both servers running
+## Manual demonstration (three Fedora terminals)
 
-Terminal 1: start a multi-client Python echo backend (testing utility, not the proxy):
+Terminal 1 - persistent multi-client test backend:
 
 ```bash
 make backend-multi
 # Concurrent echo backend listening on 127.0.0.1:9091
 ```
 
-Terminal 2: start the persistent event-driven proxy:
+Terminal 2 - proxy:
 
 ```bash
 make run
 # Listening on 127.0.0.1:9090 -> 127.0.0.1:9091
 ```
 
-Terminal 3: run different clients in succession; the proxy should remain alive:
+Terminal 3 - sample requests:
 
 ```bash
-./build/backend-client 127.0.0.1 9090 'first message'
-./build/backend-client 127.0.0.1 9090 'second message'
+./build/backend-client 127.0.0.1 9090 "hello async connect"
+./build/backend-client 127.0.0.1 9090 "a second request"
+ss -ltn '( sport = :9090 or sport = :9091 )'
 ```
 
-Expected client stdout: `first message` and `second message` respectively.
-The proxy prints an `active=N` count while connections are attached and when they
-complete. Stop the proxy/backend with Ctrl+C. The current proxy uses default
-SIGINT behavior; **graceful signal-driven shutdown is Phase 27**.
+Expected client outputs: `hello async connect` and `a second request`. The
+proxy stays running and logs `Backend connection pending; active=N` when the
+TCP handshake is still underway, followed by `Connected to backend; active=N`
+on successful completion. The pending message is not guaranteed because an
+outbound connect can also finish immediately. Stop both servers with Ctrl+C;
+controlled SIGINT shutdown is planned for Phase 27.
 
-Automated simultaneous-client proof:
+Targeted test and optional trace:
 
 ```bash
-python3 tests/test_multiclient.py
-# PASS: 2 simultaneous clients, independent buffers, fd cleanup
-# PASS: 48 concurrent requests while another client stays idle
-# PASS: 24 sequential reconnects, descriptor reuse, no fd leaks
-# PASS: Phase 6 multi-client connection tracking test suite
+python3 tests/test_async_connect.py
+strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait \
+  ./build/splice-lb 9090 127.0.0.1 9091
 ```
 
-## CLI and limitations
+Run the `strace` command with `make backend-multi` already running and use the
+client in another terminal. Expect `connect(...)= -1 EINPROGRESS` (or sometimes
+immediate success), then a `getsockopt(... SOL_SOCKET, SO_ERROR ...)` check.
+A refusal often appears as `SO_ERROR=ECONNREFUSED` after an `EPOLLERR` event.
+`strace` alters timing and is **not** a benchmark.
+
+## Why this state machine exists
+
+1. Accepted client is nonblocking. A second nonblocking socket is created.
+2. `connect()` may succeed immediately, fail immediately, or return -1 with
+   `errno=EINPROGRESS`. Only `EINPROGRESS` means an attempt is in progress.
+3. In CONNECTING state, the backend is watched for `EPOLLOUT`; the client is
+   registered but reading is temporarily paused. Thus no client payload can be
+   sent through a socket that is not connected yet.
+4. A completion/error event triggers `getsockopt(SOL_SOCKET, SO_ERROR)`. Only
+   zero means successful completion; an error closes that particular session.
+5. On success, the socket interests switch to ordinary bidirectional relay.
+   The client bytes already queued in the kernel receive level-triggered
+   `EPOLLIN` once interest is restored.
+
+Do not interpret `EPOLLOUT` as success without checking `SO_ERROR`.
+Do not keep `EPOLLOUT` armed after completion unless there is pending data:
+an always-writable socket can otherwise spin the event loop.
+
+## CLI and present limitations
 
 ```text
 ./build/splice-lb <listen-port> <backend-IPv4> <backend-port>
 ```
 
-- `listen-port` ranges 0..65535; 0 selects an available local port. Backend port 1..65535.
-- Listener binds `127.0.0.1` only; one configured numeric IPv4 backend.
-- `epoll` remains **level-triggered**. Each connection owns two sockets and two
-  8192-byte pending-data buffers. File descriptors are dynamically indexed.
-- Each kernel event carries an `(fd,generation)` token. If a closed descriptor is
-  reused, an old event cannot accidentally target the new socket.
-- A failed backend connection closes that client but does not kill the listener.
-- Backend `connect()` is **blocking** during acceptance. A stalled connect can
-  delay unrelated clients; this is addressed in Phase 7.
-- No connection limits, idle timeouts, zero-copy `splice()`, graceful shutdown,
-  or thousands-of-connections benchmarks yet.
+- Only one numeric backend IPv4 address; Round Robin comes in Phase 16.
+- The client socket deliberately waits unread while backend connects. Phase 8
+  introduces explicit bounded preconnect buffering and stronger setup handling.
+- No connect timeout (Phase 26), idle timeout, connection limit, graceful
+  shutdown, or zero-copy `splice()` pipeline yet.
+- A failed backend connection is isolated to its client. Existing connections
+  continue; the proxy does not retry on a different backend yet.
+- The proxy has not been benchmarked for thousands of concurrent sockets.
 
-## Inspect with Linux tools
+## Changed or new files in the ZIP
 
-```bash
-ss -ltn '( sport = :9090 or sport = :9091 )'
-ss -tn
-pgrep -af splice-lb
-ls -l /proc/<PID>/fd
-cat /proc/<PID>/fdinfo/<EPOLL_FD>
-# Look for tfd: lines - one listener + two endpoints per active connection.
-strace -f -e trace=epoll_wait,epoll_ctl,accept,connect,close \
-  ./build/splice-lb 9090 127.0.0.1 9091
-```
+- `src/main.c`: async backend connect states, event masks, `SO_ERROR` check.
+- `tests/connect_observer.c`: temporary test-only `connect` audit interposer.
+- `tests/test_async_connect.py`: concurrency, early data, refusal tests.
+- `tests/test_proxy.py`: permits an environment override for the test process.
+- `Makefile`: adds the Phase 7 test to `make test`.
+- `README.md`, `progress.md`: documentation and tracked progress.
 
-Replace `<PID>` and `<EPOLL_FD>` with actual numbers (without the angle brackets).
-Do not measure performance while tracing: `strace` significantly changes timing.
-
-## Phase 6 changed/new files
-
-- `src/main.c`: connection objects, dynamic fd table, generation-tagged epoll
-  tokens, multi-client accept loop, individual relay states, local cleanup.
-- `tests/test_multiclient.py`: overlap, concurrent progress, FD cleanup/reuse.
-- `tests/backend_multi.py`: persistent threaded echo backend for manual testing.
-- `tests/test_proxy.py`: older relay assertions updated for persistent listener.
-- `tests/test_epoll.py`: counts listener in epoll and tests persistent behavior.
-- `Makefile`: adds tests and `backend-multi` command.
-- `README.md`, `progress.md`: updated.
-
-**Personal PDF study material is kept outside the Git repository.**
+**Keep `phase07_learning_guide.pdf` outside the Git repo.**

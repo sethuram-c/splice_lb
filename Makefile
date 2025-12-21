@@ -42,6 +42,7 @@ test: all
 	python3 tests/test_proxy.py
 	python3 tests/test_epoll.py
 	python3 tests/test_multiclient.py
+	python3 tests/test_async_connect.py
 
 clean:
 	rm -rf build

@@ -43,4 +43,15 @@
   - [x] Keep listener alive when an individual backend connect() fails
   - [x] Verify two concurrent clients, 48 overlapping requests, 24 reconnects
   - [x] Rerun prior listener, echo, proxy, and epoll regression tests
-- [ ] Phase 7 - Client events and nonblocking backend connections
+- [x] Phase 7 - Client events and nonblocking backend connections
+  - [x] Set O_NONBLOCK before every outbound backend connect()
+  - [x] Differentiate immediate success, EINPROGRESS, and hard failure
+  - [x] Track CONNECTING/READY states for each backend connection
+  - [x] Subscribe to EPOLLOUT to learn when a connection attempt finishes
+  - [x] Verify completion with getsockopt(SOL_SOCKET, SO_ERROR)
+  - [x] Defer client reads until backend is ready and rearm EPOLLIN afterward
+  - [x] Prevent connection failure from terminating the persistent listener
+  - [x] Prove nonblocking flag before connect() with test-only LD_PRELOAD
+  - [x] Verify 36 concurrent early-send messages and 8 backend refusals
+  - [x] Re-run Phase 2-6 regression suites
+- [ ] Phase 8 - Complete backend connections and buffer client data

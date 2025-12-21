@@ -19,10 +19,10 @@ CLIENT = ROOT / "build" / "backend-client"
 TIMEOUT = 8.0
 
 
-def start_proxy(backend_port: int) -> tuple[subprocess.Popen[bytes], int]:
+def start_proxy(backend_port: int, *, env: dict[str, str] | None = None) -> tuple[subprocess.Popen[bytes], int]:
     proc = subprocess.Popen(
         [str(PROXY), "0", "127.0.0.1", str(backend_port)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
     )
     try:
         assert proc.stdout is not None

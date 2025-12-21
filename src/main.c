@@ -36,7 +36,10 @@ struct direction {
     bool source_eof;
     bool destination_shutdown;
 };
+enum backend_state { BACKEND_CONNECTING, BACKEND_READY };
+
 struct connection {
+    enum backend_state backend_state;
     struct connection *next;
     struct endpoint client;
     struct endpoint backend;
@@ -217,6 +220,12 @@ static bool read_direction(struct direction *direction) {
 }
 
 static bool update_interests(struct server *server, struct connection *connection) {
+    /* Do not read client bytes or send to the backend while connect() is pending.
+     * Level-triggered EPOLLIN will be delivered after we re-enable it. Phase 8
+     * will add explicit bounded buffering of early client data. */
+    if (connection->backend_state == BACKEND_CONNECTING)
+        return change_interest(server, &connection->client, 0) &&
+               change_interest(server, &connection->backend, EPOLLOUT);
     uint32_t client_mask = 0, backend_mask = 0;
     if (!connection->to_backend.source_eof && connection->to_backend.pending == 0)
         client_mask |= EPOLLIN;
@@ -246,23 +255,35 @@ static bool attach_connection(struct server *server, int client) {
         report_error("socket(backend)");
         goto fail;
     }
-    /* Still blocking until Phase 7's EINPROGRESS/SO_ERROR implementation. */
-    if (connect(connection->backend.fd, (const struct sockaddr *)&server->backend_address,
-                sizeof(server->backend_address)) < 0) {
+    /* O_NONBLOCK must be set *before* connect(), otherwise a slow backend
+     * can stall the whole epoll event loop. */
+    if (!set_nonblocking(connection->backend.fd)) goto fail;
+    int connect_result = connect(connection->backend.fd,
+                                 (const struct sockaddr *)&server->backend_address,
+                                 sizeof(server->backend_address));
+    if (connect_result == 0) {
+        connection->backend_state = BACKEND_READY;
+    } else if (errno == EINPROGRESS) {
+        connection->backend_state = BACKEND_CONNECTING;
+    } else {
         report_error("connect(backend)");
         goto fail;
     }
-    if (!set_nonblocking(connection->backend.fd)) goto fail;
     connection->to_backend.source = client;
     connection->to_backend.destination = connection->backend.fd;
     connection->to_client.source = connection->backend.fd;
     connection->to_client.destination = client;
-    if (!register_endpoint(server, &connection->client, EPOLLIN) ||
-        !register_endpoint(server, &connection->backend, EPOLLIN)) goto fail;
+    uint32_t client_events = connection->backend_state == BACKEND_READY ? EPOLLIN : 0;
+    uint32_t backend_events = connection->backend_state == BACKEND_READY ? EPOLLIN : EPOLLOUT;
+    if (!register_endpoint(server, &connection->client, client_events) ||
+        !register_endpoint(server, &connection->backend, backend_events)) goto fail;
     connection->next = server->connections;
     server->connections = connection;
     ++server->active;
-    printf("Connected to backend; active=%zu\n", server->active);
+    if (connection->backend_state == BACKEND_READY)
+        printf("Connected to backend; active=%zu\n", server->active);
+    else
+        printf("Backend connection pending; active=%zu\n", server->active);
     fflush(stdout);
     return true;
 fail:
@@ -288,6 +309,28 @@ static bool accept_ready(struct server *server) {
     }
 }
 
+/* A writable nonblocking TCP socket is not proof of a successful connect:
+ * it can also be writable because the handshake failed. Read SO_ERROR. */
+static bool complete_backend_connect(struct server *server,
+                                     struct connection *connection) {
+    int socket_error = 0;
+    socklen_t length = sizeof(socket_error);
+    if (getsockopt(connection->backend.fd, SOL_SOCKET, SO_ERROR,
+                   &socket_error, &length) < 0) {
+        report_error("getsockopt(SO_ERROR)");
+        return false;
+    }
+    if (socket_error != 0) {
+        errno = socket_error;
+        report_error("connect(backend)");
+        return false;
+    }
+    connection->backend_state = BACKEND_READY;
+    printf("Connected to backend; active=%zu\n", server->active);
+    fflush(stdout);
+    return update_interests(server, connection);
+}
+
 static void dispatch_client_event(struct server *server, uint64_t token,
                                   uint32_t flags) {
     int fd = (int)(uint32_t)token;
@@ -295,6 +338,18 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     struct endpoint *endpoint = server->by_fd[fd];
     if (endpoint == NULL || endpoint->token != token) return; /* stale event */
     struct connection *connection = endpoint->owner;
+    if (connection->backend_state == BACKEND_CONNECTING) {
+        /* Only a backend completion/error event may advance this connection.
+         * The client is deliberately paused until the handshake finishes. */
+        if (endpoint->is_client) return;
+        if (!(flags & (EPOLLOUT | EPOLLERR | EPOLLHUP))) return;
+        if (!complete_backend_connect(server, connection)) {
+            remove_connection(server, connection);
+            return;
+        }
+        /* Once ready, ordinary level-triggered readiness handles queued data.
+         * The current event can be processed with the normal relay handler. */
+    }
     struct direction *incoming = endpoint->is_client ?
                                  &connection->to_backend : &connection->to_client;
     struct direction *outgoing = endpoint->is_client ?
