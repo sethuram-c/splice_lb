@@ -54,4 +54,15 @@
   - [x] Prove nonblocking flag before connect() with test-only LD_PRELOAD
   - [x] Verify 36 concurrent early-send messages and 8 backend refusals
   - [x] Re-run Phase 2-6 regression suites
-- [ ] Phase 8 - Complete backend connections and buffer client data
+- [x] Phase 8 - Complete backend connections and buffer client data
+  - [x] Read client EPOLLIN while backend is still CONNECTING
+  - [x] Stage up to 8 KiB before backend readiness, without calling send()
+  - [x] Disable client reads when the staging buffer is occupied
+  - [x] Preserve early client EOF and defer forwarding FIN until READY
+  - [x] Validate SO_ERROR, drain staged bytes and rearm normal epoll interests
+  - [x] Keep preconnect staging separate per client and isolate failed connects
+  - [x] Test-only LD_PRELOAD shim defers backend readiness deterministically
+  - [x] Verify 256 KiB, 22-byte and zero-byte requests with delayed readiness
+  - [x] Verify 24 simultaneous >8 KiB requests and backend refusals
+  - [x] Re-run Phase 2-7 regression tests
+- [ ] Phase 9 - Bidirectional buffering and efficient EPOLLOUT

@@ -40,6 +40,7 @@ enum backend_state { BACKEND_CONNECTING, BACKEND_READY };
 
 struct connection {
     enum backend_state backend_state;
+    size_t preconnect_buffered; /* client bytes staged before SO_ERROR success */
     struct connection *next;
     struct endpoint client;
     struct endpoint backend;
@@ -219,13 +220,42 @@ static bool read_direction(struct direction *direction) {
     }
 }
 
+/* Staging must never send to a socket whose connect() is unfinished.
+ * A single read (at most 8 KiB) bounds preconnect memory per connection.
+ * With pending > 0, update_interests() pauses client EPOLLIN until READY. */
+static bool stage_client_data(struct connection *connection) {
+    struct direction *direction = &connection->to_backend;
+    if (direction->pending > 0 || direction->source_eof) return true;
+    for (;;) {
+        ssize_t got = recv(direction->source, direction->buffer,
+                           sizeof(direction->buffer), 0);
+        if (got > 0) {
+            direction->offset = 0;
+            direction->pending = (size_t)got;
+            connection->preconnect_buffered += (size_t)got;
+            return true;
+        }
+        if (got == 0) {
+            /* Do not propagate FIN yet: backend connect() may still be pending. */
+            direction->source_eof = true;
+            return true;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        report_error("recv(preconnect)");
+        return false;
+    }
+}
+
 static bool update_interests(struct server *server, struct connection *connection) {
-    /* Do not read client bytes or send to the backend while connect() is pending.
-     * Level-triggered EPOLLIN will be delivered after we re-enable it. Phase 8
-     * will add explicit bounded buffering of early client data. */
-    if (connection->backend_state == BACKEND_CONNECTING)
-        return change_interest(server, &connection->client, 0) &&
+    if (connection->backend_state == BACKEND_CONNECTING) {
+        /* EPOLLIN only while the staging buffer is empty: bounded backpressure.
+         * Keep EPOLLOUT on backend until SO_ERROR confirms completion. */
+        uint32_t early_read = (!connection->to_backend.source_eof &&
+                               connection->to_backend.pending == 0) ? EPOLLIN : 0;
+        return change_interest(server, &connection->client, early_read) &&
                change_interest(server, &connection->backend, EPOLLOUT);
+    }
     uint32_t client_mask = 0, backend_mask = 0;
     if (!connection->to_backend.source_eof && connection->to_backend.pending == 0)
         client_mask |= EPOLLIN;
@@ -273,7 +303,7 @@ static bool attach_connection(struct server *server, int client) {
     connection->to_backend.destination = connection->backend.fd;
     connection->to_client.source = connection->backend.fd;
     connection->to_client.destination = client;
-    uint32_t client_events = connection->backend_state == BACKEND_READY ? EPOLLIN : 0;
+    uint32_t client_events = EPOLLIN; /* stage early bytes while CONNECTING */
     uint32_t backend_events = connection->backend_state == BACKEND_READY ? EPOLLIN : EPOLLOUT;
     if (!register_endpoint(server, &connection->client, client_events) ||
         !register_endpoint(server, &connection->backend, backend_events)) goto fail;
@@ -326,9 +356,13 @@ static bool complete_backend_connect(struct server *server,
         return false;
     }
     connection->backend_state = BACKEND_READY;
-    printf("Connected to backend; active=%zu\n", server->active);
+    printf("Connected to backend; preconnect-buffered=%zu bytes; active=%zu\n",
+           connection->preconnect_buffered, server->active);
     fflush(stdout);
-    return update_interests(server, connection);
+    /* Flush staged bytes immediately, including a queued client FIN; on EAGAIN
+     * the existing EPOLLOUT interest takes over without blocking the loop. */
+    return flush_direction(&connection->to_backend) &&
+           update_interests(server, connection);
 }
 
 static void dispatch_client_event(struct server *server, uint64_t token,
@@ -339,16 +373,20 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     if (endpoint == NULL || endpoint->token != token) return; /* stale event */
     struct connection *connection = endpoint->owner;
     if (connection->backend_state == BACKEND_CONNECTING) {
-        /* Only a backend completion/error event may advance this connection.
-         * The client is deliberately paused until the handshake finishes. */
-        if (endpoint->is_client) return;
+        if (endpoint->is_client) {
+            bool ok = true;
+            if (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
+                ok = stage_client_data(connection);
+            if (!ok || !update_interests(server, connection))
+                remove_connection(server, connection);
+            return;
+        }
         if (!(flags & (EPOLLOUT | EPOLLERR | EPOLLHUP))) return;
         if (!complete_backend_connect(server, connection)) {
             remove_connection(server, connection);
             return;
         }
-        /* Once ready, ordinary level-triggered readiness handles queued data.
-         * The current event can be processed with the normal relay handler. */
+        /* Existing backend event may also carry normal readiness flags. */
     }
     struct direction *incoming = endpoint->is_client ?
                                  &connection->to_backend : &connection->to_client;

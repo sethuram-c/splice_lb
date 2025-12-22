@@ -43,6 +43,7 @@ test: all
 	python3 tests/test_epoll.py
 	python3 tests/test_multiclient.py
 	python3 tests/test_async_connect.py
+	python3 tests/test_preconnect_buffer.py
 
 clean:
 	rm -rf build

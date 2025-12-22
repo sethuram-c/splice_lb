@@ -1,56 +1,59 @@
-# Splice Load Balancer - Phase 7
+# Splice Load Balancer - Phase 8
 
-Phase 7 makes outbound backend **connection establishment nonblocking**. The
-Phase 6 proxy already accepts multiple TCP clients using level-triggered
-`epoll`, but a blocking `connect()` inside its accept loop could stall every
-client. Now the backend socket has `O_NONBLOCK` **before** `connect()`, and a
-per-connection `BACKEND_CONNECTING` / `BACKEND_READY` state tracks completion.
+Phase 8 adds **bounded preconnect client buffering** on top of Phase 7's
+nonblocking backend `connect()`. A client may send bytes before the backend
+handshake completes. We now read at most **8 KiB into the connection's
+client-to-backend buffer**, temporarily turn off client `EPOLLIN`, and only
+send the staged bytes after `getsockopt(SO_ERROR)` reports a successful
+connection. The forwarding path remains buffered and nonblocking; `splice()`
+will be introduced in Phase 10.
 
-Traffic is still forwarded using per-direction **8 KiB user-space buffers**.
-Zero-copy `splice()` starts in Phase 10. The listening interface remains
-`127.0.0.1` for safe local development.
-
-## Fedora requirements
+## Fedora prerequisites
 
 ```bash
 sudo dnf install gcc make python3 git unzip
-# Optional socket tracing and manual testing utilities:
+# Optional diagnostics and a manual TCP client:
 sudo dnf install iproute strace lsof nmap-ncat
 ```
 
-The Linux-specific `LD_PRELOAD` observer used by the Phase 7 tests compiles a
-temporary shared object using the installed C compiler. It is **test-only**;
-it is never linked into the production proxy and is deleted afterward.
+The automated preconnect delay test compiles a small **test-only**
+`LD_PRELOAD` shared object. It is not linked into the production proxy.
 
-## Apply the patch over Phase 6
+## Apply Phase 8 to Phase 7
 
 ```bash
 cd /path/to/splice-load-balancer
-unzip -o ~/Downloads/phase07_changes.zip -d .
+unzip -o ~/Downloads/phase08_changes.zip -d .
 make clean
 make
 make test
 ```
 
-Expected last line:
+Expected final test line:
 
 ```text
-PASS: Phase 7 nonblocking backend connection test suite
+PASS: Phase 8 client preconnect buffering test suite
 ```
 
-Tests for Phases 2-6 also execute. The Phase 7 tests prove that `O_NONBLOCK`
-was set at the exact outbound `connect()` invocation (through a test-only
-`LD_PRELOAD` interceptor), send 36 early client payloads concurrently, verify
-byte integrity, and check that eight rejected backend connections do not kill
-the listening socket.
+Run only the targeted suite:
 
-## Manual demonstration (three Fedora terminals)
+```bash
+python3 tests/test_preconnect_buffer.py
+```
 
-Terminal 1 - persistent multi-client test backend:
+The test holds backend `EPOLLOUT` readiness for 250 ms in a test-only shim,
+so client `EPOLLIN` gets processed while the connection is still CONNECTING.
+It verifies **exactly 8192 staged bytes** for a 256 KiB request, a small
+22-byte request, an empty half-closed request, 24 concurrent larger-than-buffer
+requests, and failure isolation for refused backends. Previous Phase 2-7
+regression suites are also run by `make test`.
+
+## Manual demonstration (three terminals)
+
+Terminal 1 - concurrent echo backend:
 
 ```bash
 make backend-multi
-# Concurrent echo backend listening on 127.0.0.1:9091
 ```
 
 Terminal 2 - proxy:
@@ -60,75 +63,57 @@ make run
 # Listening on 127.0.0.1:9090 -> 127.0.0.1:9091
 ```
 
-Terminal 3 - sample requests:
+Terminal 3 - example clients:
 
 ```bash
-./build/backend-client 127.0.0.1 9090 "hello async connect"
-./build/backend-client 127.0.0.1 9090 "a second request"
+./build/backend-client 127.0.0.1 9090 "hello before backend ready"
+./build/backend-client 127.0.0.1 9090 "second client"
 ss -ltn '( sport = :9090 or sport = :9091 )'
 ```
 
-Expected client outputs: `hello async connect` and `a second request`. The
-proxy stays running and logs `Backend connection pending; active=N` when the
-TCP handshake is still underway, followed by `Connected to backend; active=N`
-on successful completion. The pending message is not guaranteed because an
-outbound connect can also finish immediately. Stop both servers with Ctrl+C;
-controlled SIGINT shutdown is planned for Phase 27.
+Expected client outputs are their original strings. A pending backend may
+print `Backend connection pending; active=N`, followed by
+`Connected to backend; preconnect-buffered=X bytes; active=N`.
+The `X` value depends on kernel event timing in normal operation and may
+be zero. The delay-shim test is what guarantees an early-read window.
 
-Targeted test and optional trace:
+For syscall inspection (with backend still running):
 
 ```bash
-python3 tests/test_async_connect.py
-strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait \
+strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait,recvfrom,sendto \
   ./build/splice-lb 9090 127.0.0.1 9091
 ```
 
-Run the `strace` command with `make backend-multi` already running and use the
-client in another terminal. Expect `connect(...)= -1 EINPROGRESS` (or sometimes
-immediate success), then a `getsockopt(... SOL_SOCKET, SO_ERROR ...)` check.
-A refusal often appears as `SO_ERROR=ECONNREFUSED` after an `EPOLLERR` event.
-`strace` alters timing and is **not** a benchmark.
+`strace` modifies timing and is not a throughput benchmark.
 
-## Why this state machine exists
+## Algorithm: CONNECTING -> READY
 
-1. Accepted client is nonblocking. A second nonblocking socket is created.
-2. `connect()` may succeed immediately, fail immediately, or return -1 with
-   `errno=EINPROGRESS`. Only `EINPROGRESS` means an attempt is in progress.
-3. In CONNECTING state, the backend is watched for `EPOLLOUT`; the client is
-   registered but reading is temporarily paused. Thus no client payload can be
-   sent through a socket that is not connected yet.
-4. A completion/error event triggers `getsockopt(SOL_SOCKET, SO_ERROR)`. Only
-   zero means successful completion; an error closes that particular session.
-5. On success, the socket interests switch to ordinary bidirectional relay.
-   The client bytes already queued in the kernel receive level-triggered
-   `EPOLLIN` once interest is restored.
+1. `accept()` creates a nonblocking client and backend socket.
+2. If `connect()` returns `EINPROGRESS`, watch both client `EPOLLIN` and
+   backend `EPOLLOUT`.
+3. A readable client stages at most 8192 bytes in `to_backend.buffer`;
+   no send to the unconnected backend is attempted.
+4. While that staging buffer is occupied, remove client `EPOLLIN` to
+   prevent overwriting data or repeatedly reading. Kernel receive buffering
+   provides backpressure to larger client uploads.
+5. An early client EOF is recorded, **not** forwarded to the unfinished
+   backend socket.
+6. On backend completion, check `SO_ERROR`. If zero, switch to READY,
+   flush staged data (possibly partially), then continue ordinary relay.
+   If EOF was already recorded, `shutdown(SHUT_WR)` occurs *after* draining.
+7. Any setup or connect error closes only the affected connection.
 
-Do not interpret `EPOLLOUT` as success without checking `SO_ERROR`.
-Do not keep `EPOLLOUT` armed after completion unless there is pending data:
-an always-writable socket can otherwise spin the event loop.
+This design uses **one bounded preconnect buffer per connection**, not an
+unbounded queue. While the Phase 8 tests cover concurrency and correctness,
+they are not performance benchmarks and do not demonstrate 1,000+ sessions.
 
-## CLI and present limitations
+## New or modified files in the ZIP
 
-```text
-./build/splice-lb <listen-port> <backend-IPv4> <backend-port>
-```
+- `src/main.c` - early read staging, readiness gating, deferred FIN, flushing.
+- `tests/delay_backend_ready.c` - test-only readiness delay via `LD_PRELOAD`.
+- `tests/test_preconnect_buffer.py` - deterministic and concurrent integration tests.
+- `Makefile` - runs the new suite in `make test`.
+- `README.md`, `progress.md` - usage and completion notes.
 
-- Only one numeric backend IPv4 address; Round Robin comes in Phase 16.
-- The client socket deliberately waits unread while backend connects. Phase 8
-  introduces explicit bounded preconnect buffering and stronger setup handling.
-- No connect timeout (Phase 26), idle timeout, connection limit, graceful
-  shutdown, or zero-copy `splice()` pipeline yet.
-- A failed backend connection is isolated to its client. Existing connections
-  continue; the proxy does not retry on a different backend yet.
-- The proxy has not been benchmarked for thousands of concurrent sockets.
-
-## Changed or new files in the ZIP
-
-- `src/main.c`: async backend connect states, event masks, `SO_ERROR` check.
-- `tests/connect_observer.c`: temporary test-only `connect` audit interposer.
-- `tests/test_async_connect.py`: concurrency, early data, refusal tests.
-- `tests/test_proxy.py`: permits an environment override for the test process.
-- `Makefile`: adds the Phase 7 test to `make test`.
-- `README.md`, `progress.md`: documentation and tracked progress.
-
-**Keep `phase07_learning_guide.pdf` outside the Git repo.**
+Keep `phase08_learning_guide.pdf` outside Git. Other project source and tests
+from earlier phases remain in your repository unchanged.
