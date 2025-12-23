@@ -44,6 +44,7 @@ test: all
 	python3 tests/test_multiclient.py
 	python3 tests/test_async_connect.py
 	python3 tests/test_preconnect_buffer.py
+	python3 tests/test_bidirectional_buffers.py
 
 clean:
 	rm -rf build

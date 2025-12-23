@@ -65,4 +65,14 @@
   - [x] Verify 256 KiB, 22-byte and zero-byte requests with delayed readiness
   - [x] Verify 24 simultaneous >8 KiB requests and backend refusals
   - [x] Re-run Phase 2-7 regression tests
-- [ ] Phase 9 - Bidirectional buffering and efficient EPOLLOUT
+- [x] Phase 9 - Bidirectional buffering and efficient EPOLLOUT
+  - [x] Expand independent per-direction application queues to 64 KiB
+  - [x] Keep the 8 KiB Phase 8 preconnect staging limit
+  - [x] Append new data behind pending data and compact when needed
+  - [x] Disable source EPOLLIN at queue capacity, resume when space returns
+  - [x] Enable destination EPOLLOUT only while pending bytes exist
+  - [x] Flush pending bytes on write readiness; defer FIN until queue empty
+  - [x] Confirm idle EPOLLOUT is disarmed via Linux procfs
+  - [x] Exercise slow backend and slow client, 8 MiB binary each direction
+  - [x] Re-run Phase 2-8 regression suites
+- [ ] Phase 10 - First splice() experiment and per-connection pipes

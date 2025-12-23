@@ -15,7 +15,8 @@
 #include <unistd.h>
 
 #define LISTEN_BACKLOG 128
-#define COPY_BUFFER_SIZE 8192U
+#define COPY_BUFFER_SIZE 65536U
+#define PRECONNECT_BUFFER_SIZE 8192U
 #define EVENT_BATCH 64
 
 struct connection;
@@ -176,6 +177,21 @@ static bool finish_direction(struct direction *direction) {
     return true;
 }
 
+/* A direction owns a bounded, linear byte queue. [offset, offset+pending)
+ * contains unsent bytes. We compact only when the tail has no space; this
+ * allows readable sockets to fill a queue even if their peer is slow. */
+static size_t available_tail(struct direction *direction) {
+    if (direction->pending == 0) direction->offset = 0;
+    size_t tail = direction->offset + direction->pending;
+    if (tail == sizeof(direction->buffer) && direction->offset != 0) {
+        memmove(direction->buffer, direction->buffer + direction->offset,
+                direction->pending);
+        direction->offset = 0;
+        tail = direction->pending;
+    }
+    return sizeof(direction->buffer) - tail;
+}
+
 static bool flush_direction(struct direction *direction) {
     while (direction->pending > 0) {
         ssize_t written = send(direction->destination,
@@ -199,15 +215,21 @@ static bool flush_direction(struct direction *direction) {
     return finish_direction(direction);
 }
 
+/* Drain readable input into the bounded queue, not just a single 8 KiB
+ * chunk. Write attempts are nonblocking; once the 64 KiB queue fills,
+ * update_interests() removes source EPOLLIN until it drains. */
 static bool read_direction(struct direction *direction) {
-    if (direction->source_eof || direction->pending != 0) return true;
+    if (direction->source_eof) return true;
     for (;;) {
-        ssize_t got = recv(direction->source, direction->buffer,
-                           sizeof(direction->buffer), 0);
+        size_t tail_free = available_tail(direction);
+        if (tail_free == 0) return true;
+        ssize_t got = recv(direction->source,
+                           direction->buffer + direction->offset + direction->pending,
+                           tail_free, 0);
         if (got > 0) {
-            direction->offset = 0;
-            direction->pending = (size_t)got;
-            return flush_direction(direction);
+            direction->pending += (size_t)got;
+            if (!flush_direction(direction)) return false;
+            continue;
         }
         if (got == 0) {
             direction->source_eof = true;
@@ -228,7 +250,7 @@ static bool stage_client_data(struct connection *connection) {
     if (direction->pending > 0 || direction->source_eof) return true;
     for (;;) {
         ssize_t got = recv(direction->source, direction->buffer,
-                           sizeof(direction->buffer), 0);
+                           PRECONNECT_BUFFER_SIZE, 0);
         if (got > 0) {
             direction->offset = 0;
             direction->pending = (size_t)got;
@@ -257,10 +279,14 @@ static bool update_interests(struct server *server, struct connection *connectio
                change_interest(server, &connection->backend, EPOLLOUT);
     }
     uint32_t client_mask = 0, backend_mask = 0;
-    if (!connection->to_backend.source_eof && connection->to_backend.pending == 0)
+    if (!connection->to_backend.source_eof &&
+        connection->to_backend.pending < sizeof(connection->to_backend.buffer))
         client_mask |= EPOLLIN;
-    if (!connection->to_client.source_eof && connection->to_client.pending == 0)
+    if (!connection->to_client.source_eof &&
+        connection->to_client.pending < sizeof(connection->to_client.buffer))
         backend_mask |= EPOLLIN;
+    /* Writable level-triggered sockets are nearly always ready: subscribing
+     * without pending bytes would spin the event loop at idle. */
     if (connection->to_client.pending > 0) client_mask |= EPOLLOUT;
     if (connection->to_backend.pending > 0) backend_mask |= EPOLLOUT;
     return change_interest(server, &connection->client, client_mask) &&

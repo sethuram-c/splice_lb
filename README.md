@@ -1,119 +1,129 @@
-# Splice Load Balancer - Phase 8
+# Splice Load Balancer - Phase 9
 
-Phase 8 adds **bounded preconnect client buffering** on top of Phase 7's
-nonblocking backend `connect()`. A client may send bytes before the backend
-handshake completes. We now read at most **8 KiB into the connection's
-client-to-backend buffer**, temporarily turn off client `EPOLLIN`, and only
-send the staged bytes after `getsockopt(SO_ERROR)` reports a successful
-connection. The forwarding path remains buffered and nonblocking; `splice()`
-will be introduced in Phase 10.
+Phase 9 introduces **independent 64 KiB user-space queues for each TCP direction**
+and enforces demand-only `EPOLLOUT` registration. The proxy remains an
+`epoll`-driven, nonblocking *buffered* TCP relay; zero-copy `splice()` starts
+in Phase 10. Backend connection setup remains asynchronous (Phase 7).
 
-## Fedora prerequisites
+## Fedora dependencies
 
 ```bash
 sudo dnf install gcc make python3 git unzip
-# Optional diagnostics and a manual TCP client:
+# Optional for manual inspection:
 sudo dnf install iproute strace lsof nmap-ncat
 ```
 
-The automated preconnect delay test compiles a small **test-only**
-`LD_PRELOAD` shared object. It is not linked into the production proxy.
-
-## Apply Phase 8 to Phase 7
+## Apply over Phase 8
 
 ```bash
 cd /path/to/splice-load-balancer
-unzip -o ~/Downloads/phase08_changes.zip -d .
+unzip -o ~/Downloads/phase09_changes.zip -d .
 make clean
 make
 make test
 ```
 
-Expected final test line:
+The **expected final line** is:
 
 ```text
-PASS: Phase 8 client preconnect buffering test suite
+PASS: Phase 9 bidirectional buffering and efficient EPOLLOUT test suite
 ```
 
-Run only the targeted suite:
+The full `make test` runs the Phase 2-9 regression suites. To run only Phase 9:
 
 ```bash
-python3 tests/test_preconnect_buffer.py
+python3 tests/test_bidirectional_buffers.py
 ```
 
-The test holds backend `EPOLLOUT` readiness for 250 ms in a test-only shim,
-so client `EPOLLIN` gets processed while the connection is still CONNECTING.
-It verifies **exactly 8192 staged bytes** for a 256 KiB request, a small
-22-byte request, an empty half-closed request, 24 concurrent larger-than-buffer
-requests, and failure isolation for refused backends. Previous Phase 2-7
-regression suites are also run by `make test`.
+The Phase 9 tests use Linux `/proc/<pid>/fdinfo/<epoll-fd>` to confirm that
+idle connections have no `EPOLLOUT` interest, then test **8 MiB of binary
+traffic** toward each direction independently with deliberately slow readers.
+Both stress tests observe `EPOLLOUT` become enabled when real kernel TCP
+backpressure leaves data in the proxy's application queue. A slow peer is
+expected to delay, not lose or corrupt, bytes.
 
-## Manual demonstration (three terminals)
+## Manual test (three terminals)
 
-Terminal 1 - concurrent echo backend:
+Terminal 1 (multi-client backend):
 
 ```bash
 make backend-multi
 ```
 
-Terminal 2 - proxy:
+Terminal 2 (proxy):
 
 ```bash
 make run
 # Listening on 127.0.0.1:9090 -> 127.0.0.1:9091
 ```
 
-Terminal 3 - example clients:
+Terminal 3 (client, expected to print the input string):
 
 ```bash
-./build/backend-client 127.0.0.1 9090 "hello before backend ready"
-./build/backend-client 127.0.0.1 9090 "second client"
+./build/backend-client 127.0.0.1 9090 "phase nine"
 ss -ltn '( sport = :9090 or sport = :9091 )'
 ```
 
-Expected client outputs are their original strings. A pending backend may
-print `Backend connection pending; active=N`, followed by
-`Connected to backend; preconnect-buffered=X bytes; active=N`.
-The `X` value depends on kernel event timing in normal operation and may
-be zero. The delay-shim test is what guarantees an early-read window.
-
-For syscall inspection (with backend still running):
+Inspect the epoll watch flags while a client is connected and idle:
 
 ```bash
-strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait,recvfrom,sendto \
+PID=$(pidof splice-lb)
+ls -l /proc/$PID/fd
+# Find the descriptor shown as anon_inode:[eventpoll], then:
+cat /proc/$PID/fdinfo/<EPOLL_FD>
+```
+
+Replace `<EPOLL_FD>` with that decimal descriptor number. An `events:`
+mask in `/proc/.../fdinfo` is printed in hexadecimal; the `EPOLLOUT` bit is
+`0x004`. Each watched socket may also carry automatically added `EPOLLERR`
+and `EPOLLHUP` flags. The focused Python test parses and checks this correctly.
+
+Tracing calls (restart the proxy in Terminal 2 using this command):
+
+```bash
+strace -f -e trace=epoll_ctl,epoll_wait,recvfrom,sendto,shutdown \
   ./build/splice-lb 9090 127.0.0.1 9091
 ```
 
-`strace` modifies timing and is not a throughput benchmark.
+`strace` changes scheduling; do not use it for benchmarking.
 
-## Algorithm: CONNECTING -> READY
+## Phase 9 internals
 
-1. `accept()` creates a nonblocking client and backend socket.
-2. If `connect()` returns `EINPROGRESS`, watch both client `EPOLLIN` and
-   backend `EPOLLOUT`.
-3. A readable client stages at most 8192 bytes in `to_backend.buffer`;
-   no send to the unconnected backend is attempted.
-4. While that staging buffer is occupied, remove client `EPOLLIN` to
-   prevent overwriting data or repeatedly reading. Kernel receive buffering
-   provides backpressure to larger client uploads.
-5. An early client EOF is recorded, **not** forwarded to the unfinished
-   backend socket.
-6. On backend completion, check `SO_ERROR`. If zero, switch to READY,
-   flush staged data (possibly partially), then continue ordinary relay.
-   If EOF was already recorded, `shutdown(SHUT_WR)` occurs *after* draining.
-7. Any setup or connect error closes only the affected connection.
+A connection has two **separate** `struct direction` objects: client-to-backend
+and backend-to-client. Each has a `buffer[65536]`, an `offset` into the first
+unsent byte, a `pending` count, and EOF/shutdown flags. Reads append to the
+tail and can continue even while some unsent bytes remain; when the tail has
+no room, `memmove()` compacts the queue. A destination write advances the
+prefix; it never drops a partially sent suffix. Reads pause when `pending`
+reaches 64 KiB, so kernel TCP receive-window control supplies backpressure.
 
-This design uses **one bounded preconnect buffer per connection**, not an
-unbounded queue. While the Phase 8 tests cover concurrency and correctness,
-they are not performance benchmarks and do not demonstrate 1,000+ sessions.
+`update_interests()` arms the destination's `EPOLLOUT` **only when `pending > 0`**
+and arms the source's `EPOLLIN` only when `pending < 65536` and EOF has not
+occurred. The backend's `EPOLLOUT` is also needed during `CONNECTING` to
+complete nonblocking `connect()`; this is a *different* use of the flag.
 
-## New or modified files in the ZIP
+During `CONNECTING`, the Phase 8 limit is unchanged: only the **first 8192
+bytes** may be staged before `SO_ERROR` confirms the backend is connected.
+Once READY, the 64 KiB direction queue is available. EOF is forwarded with
+`shutdown(SHUT_WR)` **only when that direction's queue drains completely**.
+This preserves TCP half-close semantics and the earlier regression tests.
 
-- `src/main.c` - early read staging, readiness gating, deferred FIN, flushing.
-- `tests/delay_backend_ready.c` - test-only readiness delay via `LD_PRELOAD`.
-- `tests/test_preconnect_buffer.py` - deterministic and concurrent integration tests.
-- `Makefile` - runs the new suite in `make test`.
-- `README.md`, `progress.md` - usage and completion notes.
+## Files changed in this phase
 
-Keep `phase08_learning_guide.pdf` outside Git. Other project source and tests
-from earlier phases remain in your repository unchanged.
+- `src/main.c` - independent 64 KiB byte queues and conditional readiness.
+- `tests/test_bidirectional_buffers.py` - idle-interest and two slow-peer tests.
+- `Makefile` - run Phase 9 suite with the regressions.
+- `README.md`, `progress.md` - phase instructions and checklist.
+
+The companion `phase09_learning_guide.pdf` is personal study material and is
+**not** part of the source ZIP or Git commit.
+
+## Current limits
+
+Buffers are fixed-size and are allocated per connection: 2 x 65536 bytes
+(~128 KiB), excluding sockets, bookkeeping, and kernel buffers. Ten thousand
+such objects alone would use ~1.22 GiB, *not* a scalable final memory budget.
+Later phases introduce `splice()` pipes and resource limits; do not make
+10,000-connection or throughput claims before benchmarking.
+EOF and abrupt connection failures still need additional corner-case testing
+in their later scheduled phases.
