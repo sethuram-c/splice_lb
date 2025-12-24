@@ -76,3 +76,16 @@
   - [x] Exercise slow backend and slow client, 8 MiB binary each direction
   - [x] Re-run Phase 2-8 regression suites
 - [ ] Phase 10 - First splice() experiment and per-connection pipes
+- [x] Phase 10 - First `splice()` experiment and per-connection pipes
+  - [x] Add `src/splice_demo.c` for regular-file -> pipe -> regular-file `splice()`
+  - [x] Handle partial pipe drains, EINTR, file EOF, and error paths
+  - [x] Protect the input file against output path aliases/hard links
+  - [x] Allocate two dedicated, nonblocking, CLOEXEC pipe pairs per proxy connection
+  - [x] Initialize all four pipe descriptors to -1 before setup
+  - [x] Release four pipe descriptors on normal cleanup and partial-setup errors
+  - [x] Preserve Phase 9 epoll-based buffered TCP forwarding unchanged
+  - [x] Test zero-byte, binary, 64 KiB+ and >2 MiB transfers with exact integrity
+  - [x] Verify 2 connections = 4 distinct pipe pairs (8 pipe fds)
+  - [x] Check `O_NONBLOCK` and `O_CLOEXEC` via /proc fdinfo and check for leaks
+  - [x] Re-run Phase 2-9 regression suites
+- [ ] Phase 11 - Direction state and client-to-pipe transfer

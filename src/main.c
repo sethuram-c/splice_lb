@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
@@ -45,6 +46,10 @@ struct connection {
     struct connection *next;
     struct endpoint client;
     struct endpoint backend;
+    /* Reserved for Phase 11+: one nonblocking pipe per traffic direction.
+     * Phase 10 retains buffered recv()/send() forwarding unchanged. */
+    int pipe_to_backend[2];
+    int pipe_to_client[2];
     struct direction to_backend;
     struct direction to_client;
 };
@@ -151,12 +156,41 @@ static void release_endpoint(struct server *server, struct endpoint *endpoint) {
     endpoint->fd = -1;
 }
 
+/* Each TCP session owns separate pipes for the two data directions.
+ * The pipe fds are intentionally NOT registered with epoll yet: Phase 10 is
+ * pipe resource setup; Phase 11 begins socket -> pipe splice() forwarding. */
+static bool create_connection_pipes(struct connection *connection) {
+    if (pipe2(connection->pipe_to_backend, O_NONBLOCK | O_CLOEXEC) < 0) {
+        report_error("pipe2(client-to-backend)");
+        return false;
+    }
+    if (pipe2(connection->pipe_to_client, O_NONBLOCK | O_CLOEXEC) < 0) {
+        report_error("pipe2(backend-to-client)");
+        return false;
+    }
+    return true;
+}
+
+static void close_connection_pipes(struct connection *connection) {
+    int *const pipe_ends[] = {
+        &connection->pipe_to_backend[0], &connection->pipe_to_backend[1],
+        &connection->pipe_to_client[0], &connection->pipe_to_client[1]
+    };
+    for (size_t i = 0; i < sizeof(pipe_ends) / sizeof(pipe_ends[0]); ++i) {
+        if (*pipe_ends[i] >= 0) {
+            if (close(*pipe_ends[i]) < 0) report_error("close(pipe)");
+            *pipe_ends[i] = -1;
+        }
+    }
+}
+
 static void remove_connection(struct server *server, struct connection *connection) {
     struct connection **cursor = &server->connections;
     while (*cursor != NULL && *cursor != connection) cursor = &(*cursor)->next;
     if (*cursor == connection) *cursor = connection->next;
     release_endpoint(server, &connection->client);
     release_endpoint(server, &connection->backend);
+    close_connection_pipes(connection);
     if (server->active > 0) --server->active;
     printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
            "backend-to-client=%" PRIu64 " bytes; active=%zu\n",
@@ -302,6 +336,10 @@ static bool attach_connection(struct server *server, int client) {
     }
     connection->client.fd = client;
     connection->backend.fd = -1;
+    connection->pipe_to_backend[0] = -1;
+    connection->pipe_to_backend[1] = -1;
+    connection->pipe_to_client[0] = -1;
+    connection->pipe_to_client[1] = -1;
     connection->client.is_client = true;
     connection->client.owner = connection;
     connection->backend.owner = connection;
@@ -329,6 +367,9 @@ static bool attach_connection(struct server *server, int client) {
     connection->to_backend.destination = connection->backend.fd;
     connection->to_client.source = connection->backend.fd;
     connection->to_client.destination = client;
+    /* Both pipe pairs must exist before the connection is visible in epoll.
+     * Any error takes the same cleanup path (including partially made pipes). */
+    if (!create_connection_pipes(connection)) goto fail;
     uint32_t client_events = EPOLLIN; /* stage early bytes while CONNECTING */
     uint32_t backend_events = connection->backend_state == BACKEND_READY ? EPOLLIN : EPOLLOUT;
     if (!register_endpoint(server, &connection->client, client_events) ||
@@ -345,6 +386,7 @@ static bool attach_connection(struct server *server, int client) {
 fail:
     release_endpoint(server, &connection->client);
     release_endpoint(server, &connection->backend);
+    close_connection_pipes(connection);
     free(connection);
     return false;
 }

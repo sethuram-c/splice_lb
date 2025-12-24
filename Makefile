@@ -6,11 +6,16 @@ LDLIBS ?=
 SERVER := build/splice-lb
 CLIENT := build/backend-client
 ECHO := build/echo-backend
+SPLICE_DEMO := build/splice-demo
 
 .PHONY: all clean test run
-all: $(SERVER) $(CLIENT) $(ECHO)
+all: $(SERVER) $(CLIENT) $(ECHO) $(SPLICE_DEMO)
 
 $(SERVER): src/main.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(SPLICE_DEMO): src/splice_demo.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
@@ -45,6 +50,7 @@ test: all
 	python3 tests/test_async_connect.py
 	python3 tests/test_preconnect_buffer.py
 	python3 tests/test_bidirectional_buffers.py
+	python3 tests/test_splice_pipes.py
 
 clean:
 	rm -rf build

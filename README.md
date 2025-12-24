@@ -127,3 +127,84 @@ Later phases introduce `splice()` pipes and resource limits; do not make
 10,000-connection or throughput claims before benchmarking.
 EOF and abrupt connection failures still need additional corner-case testing
 in their later scheduled phases.
+
+## Phase 10 - first `splice()` experiment and per-connection pipes
+
+**What is new:** `build/splice-demo` copies a regular file through a Linux
+pipe using `splice(input -> pipe)` followed by `splice(pipe -> output)`.
+The TCP proxy also allocates **two nonblocking pipes per accepted connection**:
+`pipe_to_backend[2]` and `pipe_to_client[2]`, created with
+`pipe2(O_NONBLOCK | O_CLOEXEC)`. Each pipe has a read fd at index 0 and a
+write fd at index 1. All four fds are closed on connection removal and any
+partial-setup failure.
+
+**Important:** This phase does **not** use `splice()` inside the TCP proxy.
+The live forwarding path still uses Phase 9's bounded `recv()`/`send()`
+buffers. We first prove `splice()` independently and ensure pipe resources
+are correct; Phase 11 begins client-socket-to-pipe forwarding.
+
+### Build and run on Fedora
+
+```bash
+make clean
+make
+make test
+# Focused test only (make must have built the binaries first):
+python3 tests/test_splice_pipes.py
+```
+
+Experiment with an 800 KiB deterministic input, including NUL bytes:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+Path('/tmp/splice-phase10-in.bin').write_bytes(bytes(range(256)) * 3200)
+PY
+./build/splice-demo /tmp/splice-phase10-in.bin /tmp/splice-phase10-out.bin
+cmp /tmp/splice-phase10-in.bin /tmp/splice-phase10-out.bin
+sha256sum /tmp/splice-phase10-in.bin /tmp/splice-phase10-out.bin
+```
+
+Expected demo line: `splice-demo: transferred 819200 bytes`. `cmp` exits
+with status 0 and prints nothing when the files are byte-for-byte equal.
+Both `sha256sum` digests should match. The demo safely rejects an input
+and output referencing the same inode (including hard links), preventing
+accidental truncation of the input.
+
+Optional syscall trace (install `strace` on Fedora if needed):
+
+```bash
+strace -e trace=pipe2,splice ./build/splice-demo \
+  /tmp/splice-phase10-in.bin /tmp/splice-phase10-out.bin
+```
+
+The demo uses a **blocking** pipe to make its first experiment easy to
+understand. The proxy's per-session pipes, in contrast, are **nonblocking**.
+The `SPLICE_F_MOVE` hint is not a promise that data is never copied; the
+actual kernel implementation and descriptors determine transfer behavior.
+
+### Live proxy still works
+
+In three separate terminals:
+
+```bash
+make backend-multi
+make run
+./build/backend-client 127.0.0.1 9090 'hello phase 10'
+```
+
+Expected client output: `hello phase 10`. For the per-session pipe
+allocation and cleanup test run `python3 tests/test_splice_pipes.py`.
+Linux `/proc/<pid>/fd` symlinks expose each live pipe as `pipe:[inode]`;
+`/proc/<pid>/fdinfo/<fd>` contains the octal `flags` checked by the test.
+Standard process output streams can themselves be pipes; the automated
+inspection ignores descriptors 0-2.
+
+### Limits and later work
+
+Phase 10 still allocates 2 x 64 KiB in user-space buffers per session,
+**plus** four pipe descriptors and kernel pipe storage. Pipe buffers also
+consume kernel resources: thousands of sessions must be verified later
+against memory and `ulimit -n` rather than assumed to scale. Pipe-to-socket
+forwarding, `EAGAIN` recovery, and pipe occupancy tracking follow in Phases
+11-14. The learning guide PDF is personal study material, not a repo file.
