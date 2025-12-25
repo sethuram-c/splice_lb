@@ -28,9 +28,16 @@ struct endpoint {
     bool is_client;
     struct connection *owner;
 };
+enum direction_input_mode { INPUT_COPY, INPUT_SPLICE_TO_PIPE };
 struct direction {
     int source;
     int destination;
+    enum direction_input_mode input_mode;
+    int pipe_read_fd;
+    int pipe_write_fd;
+    /* Kernel pipe occupancy tracked separately from the user-space queue. */
+    size_t pipe_pending;
+    uint64_t spliced_to_pipe;
     unsigned char buffer[COPY_BUFFER_SIZE];
     size_t offset;
     size_t pending;
@@ -46,8 +53,7 @@ struct connection {
     struct connection *next;
     struct endpoint client;
     struct endpoint backend;
-    /* Reserved for Phase 11+: one nonblocking pipe per traffic direction.
-     * Phase 10 retains buffered recv()/send() forwarding unchanged. */
+    /* Each direction owns a pipe, but only client -> pipe is active in Phase 11. */
     int pipe_to_backend[2];
     int pipe_to_client[2];
     struct direction to_backend;
@@ -156,9 +162,8 @@ static void release_endpoint(struct server *server, struct endpoint *endpoint) {
     endpoint->fd = -1;
 }
 
-/* Each TCP session owns separate pipes for the two data directions.
- * The pipe fds are intentionally NOT registered with epoll yet: Phase 10 is
- * pipe resource setup; Phase 11 begins socket -> pipe splice() forwarding. */
+/* Pipes remain outside epoll: splice socket readiness is watched on the
+ * source fd, while destination EPOLLOUT drains the existing byte queue. */
 static bool create_connection_pipes(struct connection *connection) {
     if (pipe2(connection->pipe_to_backend, O_NONBLOCK | O_CLOEXEC) < 0) {
         report_error("pipe2(client-to-backend)");
@@ -193,16 +198,17 @@ static void remove_connection(struct server *server, struct connection *connecti
     close_connection_pipes(connection);
     if (server->active > 0) --server->active;
     printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
-           "backend-to-client=%" PRIu64 " bytes; active=%zu\n",
+           "backend-to-client=%" PRIu64 " bytes; active=%zu; "
+           "client-to-pipe=%" PRIu64 " bytes\n",
            connection->to_backend.forwarded, connection->to_client.forwarded,
-           server->active);
+           server->active, connection->to_backend.spliced_to_pipe);
     fflush(stdout);
     free(connection);
 }
 
 static bool finish_direction(struct direction *direction) {
     if (!direction->source_eof || direction->pending != 0 ||
-        direction->destination_shutdown) return true;
+        direction->pipe_pending != 0 || direction->destination_shutdown) return true;
     if (shutdown(direction->destination, SHUT_WR) < 0) {
         report_error("shutdown(SHUT_WR)");
         return false;
@@ -276,6 +282,60 @@ static bool read_direction(struct direction *direction) {
     }
 }
 
+/* Phase 11's client -> pipe splice path.  The pipe is drained immediately
+ * with read() into the Phase 9 bounded output queue; the final destination
+ * still uses send(), so Phase 12 can replace the pipe drain independently.
+ * Never claim this hybrid flow is end-to-end zero-copy. */
+static bool drain_input_pipe(struct direction *direction) {
+    while (direction->pipe_pending > 0) {
+        size_t free_tail = available_tail(direction);
+        if (free_tail == 0) return true;
+        size_t count = direction->pipe_pending < free_tail ?
+                       direction->pipe_pending : free_tail;
+        ssize_t got = read(direction->pipe_read_fd,
+                           direction->buffer + direction->offset + direction->pending,
+                           count);
+        if (got > 0) {
+            direction->pipe_pending -= (size_t)got;
+            direction->pending += (size_t)got;
+            continue;
+        }
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        if (got == 0) fputs("read(pipe) unexpectedly returned EOF\n", stderr);
+        else report_error("read(pipe)");
+        return false;
+    }
+    return true;
+}
+
+static bool read_spliced_client(struct direction *direction) {
+    if (direction->source_eof) return true;
+    for (;;) {
+        if (!drain_input_pipe(direction)) return false;
+        if (direction->pipe_pending > 0) return true;
+        size_t free_tail = available_tail(direction);
+        if (free_tail == 0) return true;
+        ssize_t got = splice(direction->source, NULL, direction->pipe_write_fd,
+                             NULL, free_tail, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (got > 0) {
+            direction->pipe_pending += (size_t)got;
+            direction->spliced_to_pipe += (uint64_t)got;
+            if (!drain_input_pipe(direction) || !flush_direction(direction))
+                return false;
+            continue;
+        }
+        if (got == 0) {
+            direction->source_eof = true;
+            return finish_direction(direction);
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        report_error("splice(client -> pipe)");
+        return false;
+    }
+}
+
 /* Staging must never send to a socket whose connect() is unfinished.
  * A single read (at most 8 KiB) bounds preconnect memory per connection.
  * With pending > 0, update_interests() pauses client EPOLLIN until READY. */
@@ -314,6 +374,7 @@ static bool update_interests(struct server *server, struct connection *connectio
     }
     uint32_t client_mask = 0, backend_mask = 0;
     if (!connection->to_backend.source_eof &&
+        connection->to_backend.pipe_pending == 0 &&
         connection->to_backend.pending < sizeof(connection->to_backend.buffer))
         client_mask |= EPOLLIN;
     if (!connection->to_client.source_eof &&
@@ -365,11 +426,14 @@ static bool attach_connection(struct server *server, int client) {
     }
     connection->to_backend.source = client;
     connection->to_backend.destination = connection->backend.fd;
+    connection->to_backend.input_mode = INPUT_SPLICE_TO_PIPE;
     connection->to_client.source = connection->backend.fd;
     connection->to_client.destination = client;
     /* Both pipe pairs must exist before the connection is visible in epoll.
      * Any error takes the same cleanup path (including partially made pipes). */
     if (!create_connection_pipes(connection)) goto fail;
+    connection->to_backend.pipe_read_fd = connection->pipe_to_backend[0];
+    connection->to_backend.pipe_write_fd = connection->pipe_to_backend[1];
     uint32_t client_events = EPOLLIN; /* stage early bytes while CONNECTING */
     uint32_t backend_events = connection->backend_state == BACKEND_READY ? EPOLLIN : EPOLLOUT;
     if (!register_endpoint(server, &connection->client, client_events) ||
@@ -462,8 +526,10 @@ static void dispatch_client_event(struct server *server, uint64_t token,
                                  &connection->to_client : &connection->to_backend;
     bool ok = true;
     if (flags & EPOLLOUT) ok = flush_direction(outgoing);
-    if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)))
-        ok = read_direction(incoming);
+    if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))) {
+        ok = incoming->input_mode == INPUT_SPLICE_TO_PIPE ?
+             read_spliced_client(incoming) : read_direction(incoming);
+    }
     if (ok && incoming->destination_shutdown && outgoing->destination_shutdown) {
         remove_connection(server, connection);
         return;

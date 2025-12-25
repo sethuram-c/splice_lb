@@ -1,3 +1,119 @@
+# Splice Load Balancer - Phase 11
+
+**Phase 11: direction state and client-to-pipe transfer.** Target: Fedora Linux.
+This is a partial kernel-pipe data path, **not a complete zero-copy proxy**.
+
+## What changed
+
+- The client-to-backend `struct direction` has explicit `input_mode` state:
+  `INPUT_SPLICE_TO_PIPE`; backend-to-client retains `INPUT_COPY`.
+- After backend readiness, the client input path calls Linux `splice()` from
+  the nonblocking TCP socket into the dedicated `pipe_to_backend` write end.
+- The proxy immediately drains the pipe read end with `read()` into the
+  existing bounded 64 KiB queue and sends via nonblocking `send()`.
+- `pipe_pending` counts kernel-pipe bytes separately from `pending`, which
+  counts user-space bytes. EOF-to-FIN propagation waits for both to drain.
+- During `CONNECTING`, the existing 8 KiB `recv()` staging behavior remains
+  unchanged: no splice() is attempted before the backend is ready.
+- The reverse direction retains `recv()` -> buffered `send()`. Phase 12 will
+  implement the pipe-to-backend stage and the reverse splice path.
+- A test-only LD_PRELOAD interposer proves the actual running proxy calls
+  `splice(socket, pipe)`; the tests also verify data and half-close integrity.
+
+## Fedora prerequisites
+
+```bash
+sudo dnf install gcc make python3 git unzip
+# Optional inspection commands:
+sudo dnf install strace iproute nmap-ncat
+```
+
+## Apply Phase 11 over Phase 10
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase11_changes.zip
+unzip -o ~/Downloads/phase11_changes.zip -d .
+make clean
+make
+make test
+```
+
+Expected last line:
+
+```text
+PASS: Phase 11 direction state and client-to-pipe splice test suite
+```
+
+Focused testing (after `make`):
+
+```bash
+python3 tests/test_client_splice.py
+```
+
+## Manual forwarding test - three terminals
+
+```bash
+# Terminal A: test echo backend
+make backend-multi
+# Terminal B: proxy
+make run
+# Terminal C: client
+./build/backend-client 127.0.0.1 9090 "hello phase 11"
+```
+
+The client prints `hello phase 11`. The proxy remains running after the
+connection ends and its log includes a `client-to-pipe=N bytes` counter.
+For tiny requests, the count may be **0** because Phase 8's preconnect buffer
+can absorb the full request before the backend connection is ready. The
+focused 512 KiB automated test guarantees that live `splice()` occurs.
+
+To see the exact kernel calls, run the proxy through `strace` in Terminal B:
+
+```bash
+strace -e trace=splice,read,sendto,epoll_ctl,epoll_wait \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+`strace` writes syscall traces to stderr. Look for `splice(client_fd, NULL,
+pipe_write_fd, NULL, count, SPLICE_F_MOVE|SPLICE_F_NONBLOCK)` followed by
+`read(pipe_read_fd, ...)` and `sendto(backend_fd, ...)`. Use a large client
+payload to bypass preconnect staging. `strace` affects scheduling; do not use
+it for performance benchmarks. The focused test uses `LD_PRELOAD` to audit
+successful `splice()` calls reliably without relying on trace timing.
+
+## Data-path design and limitations
+
+```text
+client socket --splice()--> [kernel pipe] --read()--> [64 KiB queue]
+                                                     --send()--> backend socket
+backend socket --recv()--> [64 KiB queue] --send()--> client socket
+```
+
+`pipe_pending` tracks bytes in the kernel pipe; `pending` tracks bytes in the
+application queue. Total delivery accounting increments only after successful
+`send()` to the backend. `EPOLLOUT` remains demand-driven. The test shims are
+not linked into the proxy; they are compiled only inside the Python test.
+
+Phase 11 is a correctness checkpoint, not a throughput improvement claim:
+there is still a kernel-to-user copy and user-to-kernel send. Full `splice()`
+forwarding, zero-copy claims, two-way backpressure, and performance
+benchmarking belong to later phases.
+
+## Source changes and personal learning notes
+
+- `src/main.c`: state, socket-to-pipe splice, pipe-to-buffer drain, EOF gating.
+- `tests/splice_observer.c`: test-only syscall audit shim.
+- `tests/test_client_splice.py`: 512 KiB integrity, delayed connect and EOF.
+- `Makefile`: include the Phase 11 tests.
+- `README.md`, `progress.md`: instructions and learning checklist.
+
+`phase11_learning_guide.pdf` is kept **outside this repository and ZIP**.
+
+---
+
+## Earlier phase notes (historical)
+
 # Splice Load Balancer - Phase 9
 
 Phase 9 introduces **independent 64 KiB user-space queues for each TCP direction**

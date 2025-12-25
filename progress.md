@@ -75,7 +75,6 @@
   - [x] Confirm idle EPOLLOUT is disarmed via Linux procfs
   - [x] Exercise slow backend and slow client, 8 MiB binary each direction
   - [x] Re-run Phase 2-8 regression suites
-- [ ] Phase 10 - First splice() experiment and per-connection pipes
 - [x] Phase 10 - First `splice()` experiment and per-connection pipes
   - [x] Add `src/splice_demo.c` for regular-file -> pipe -> regular-file `splice()`
   - [x] Handle partial pipe drains, EINTR, file EOF, and error paths
@@ -88,4 +87,15 @@
   - [x] Verify 2 connections = 4 distinct pipe pairs (8 pipe fds)
   - [x] Check `O_NONBLOCK` and `O_CLOEXEC` via /proc fdinfo and check for leaks
   - [x] Re-run Phase 2-9 regression suites
-- [ ] Phase 11 - Direction state and client-to-pipe transfer
+- [x] Phase 11 - Direction state and client-to-pipe transfer
+  - [x] Introduce explicit direction input modes (COPY and SPLICE_TO_PIPE)
+  - [x] Track client-to-backend kernel pipe pending and successfully spliced bytes
+  - [x] Use splice(client TCP socket -> pipe write end) after backend readiness
+  - [x] Drain pipe with read() into the Phase 9 bounded user-space queue
+  - [x] Preserve 8 KiB preconnect recv() staging and client half-closes
+  - [x] Defer FIN until both pipe and byte queue are empty
+  - [x] Leave reverse direction buffered and retain demand-only EPOLLOUT
+  - [x] Audit successful live splice calls using a test-only LD_PRELOAD shim
+  - [x] Test 512 KiB binary under immediate and delayed connection readiness
+  - [x] Preserve empty-request EOF semantics and run Phase 2-10 tests
+- [ ] Phase 12 - Complete client-to-backend and reverse splice paths
