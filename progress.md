@@ -98,4 +98,16 @@
   - [x] Audit successful live splice calls using a test-only LD_PRELOAD shim
   - [x] Test 512 KiB binary under immediate and delayed connection readiness
   - [x] Preserve empty-request EOF semantics and run Phase 2-10 tests
-- [ ] Phase 12 - Complete client-to-backend and reverse splice paths
+- [x] Phase 12 - Complete client-to-backend and reverse splice paths
+  - [x] Replace Phase 11 client pipe read/send with pipe-to-backend splice()
+  - [x] Enable the independent backend-to-client two-hop splice() path
+  - [x] Track per-direction pipe input, pipe output, and destination delivery
+  - [x] Preserve preconnect recv/send staging ahead of subsequent splice bytes
+  - [x] Gate EPOLLIN while the corresponding direction still has pending output
+  - [x] Register EPOLLOUT only when staged or pipe bytes need draining
+  - [x] Delay write-side shutdown until both kinds of pending bytes drain
+  - [x] Ignore SIGPIPE and handle EPIPE as a per-session failure
+  - [x] Audit both splice() hop directions with test-only LD_PRELOAD
+  - [x] Verify full 1 MiB binary data in both directions, delayed backend, FIN
+  - [x] Re-run all Phase 2-11 tests and test the Phase 11 ZIP merge sequence
+- [ ] Phase 13 - Partial transfers and pipe-fill EAGAIN

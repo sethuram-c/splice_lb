@@ -28,6 +28,19 @@ ssize_t splice(int in_fd, off64_t *in_offset, int out_fd,
                     (void)close(out);
                 }
             }
+        } else if (fstat(in_fd, &in_info) == 0 &&
+                   fstat(out_fd, &out_info) == 0 &&
+                   S_ISFIFO(in_info.st_mode) && S_ISSOCK(out_info.st_mode)) {
+            const char *path = getenv("SPLICE_AUDIT_FILE");
+            if (path != NULL && *path) {
+                int out = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                               0600);
+                if (out >= 0) {
+                    (void)dprintf(out, "pipe-to-socket bytes=%ld flags=%u\n",
+                                  result, flags);
+                    (void)close(out);
+                }
+            }
         }
     }
     errno = saved_errno;

@@ -52,6 +52,7 @@ test: all
 	python3 tests/test_bidirectional_buffers.py
 	python3 tests/test_splice_pipes.py
 	python3 tests/test_client_splice.py
+	python3 tests/test_full_splice.py
 
 clean:
 	rm -rf build

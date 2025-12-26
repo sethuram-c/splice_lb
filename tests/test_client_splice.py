@@ -65,7 +65,10 @@ def exercise_splice(*, delay_connect: bool) -> None:
                 observed = sum(int(m[1]) for line in lines
                                if (m := re.fullmatch(
                                    r'socket-to-pipe bytes=(\d+) flags=(\d+)', line)))
-                assert len(lines) > 0 and observed == measured, (observed, measured)
+                reverse = re.search(rb'backend-to-pipe=(\d+) bytes', stdout)
+                assert reverse, stdout
+                # Phase 12 also invokes socket->pipe splice on the reverse leg.
+                assert lines and observed == measured + int(reverse[1]), (observed, measured)
                 if delay_connect:
                     stage = re.search(rb'preconnect-buffered=(\d+) bytes', stdout)
                     assert stage and int(stage[1]) == 8192, (stage, stdout)

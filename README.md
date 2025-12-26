@@ -1,114 +1,124 @@
-# Splice Load Balancer - Phase 11
+# Splice Load Balancer - Phase 12
 
-**Phase 11: direction state and client-to-pipe transfer.** Target: Fedora Linux.
-This is a partial kernel-pipe data path, **not a complete zero-copy proxy**.
+**Phase 12: complete client-to-backend and reverse `splice()` paths.**
+Target: Fedora Linux. The live relay now transfers TCP traffic in both directions
+using Linux `splice()` through separate nonblocking kernel pipes.
 
 ## What changed
 
-- The client-to-backend `struct direction` has explicit `input_mode` state:
-  `INPUT_SPLICE_TO_PIPE`; backend-to-client retains `INPUT_COPY`.
-- After backend readiness, the client input path calls Linux `splice()` from
-  the nonblocking TCP socket into the dedicated `pipe_to_backend` write end.
-- The proxy immediately drains the pipe read end with `read()` into the
-  existing bounded 64 KiB queue and sends via nonblocking `send()`.
-- `pipe_pending` counts kernel-pipe bytes separately from `pending`, which
-  counts user-space bytes. EOF-to-FIN propagation waits for both to drain.
-- During `CONNECTING`, the existing 8 KiB `recv()` staging behavior remains
-  unchanged: no splice() is attempted before the backend is ready.
-- The reverse direction retains `recv()` -> buffered `send()`. Phase 12 will
-  implement the pipe-to-backend stage and the reverse splice path.
-- A test-only LD_PRELOAD interposer proves the actual running proxy calls
-  `splice(socket, pipe)`; the tests also verify data and half-close integrity.
+- Client-to-backend now forwards using `splice(client socket -> pipe)` followed
+  by `splice(pipe -> backend socket)`; it no longer drains its pipe using
+  `read()` into a C buffer during normal forwarding.
+- Backend-to-client now uses the independent second pipe and the same two-hop
+  `splice()` transfer logic.
+- Phase 8's **8 KiB preconnect staging queue** remains a deliberate exception:
+  data received before the backend is READY still uses `recv()` and `send()`.
+  Staged bytes are always sent **before** subsequently spliced bytes.
+- Per-direction `pipe_pending`, `spliced_to_pipe`, `spliced_from_pipe`, and
+  `forwarded` counters distinguish kernel pipe occupancy from data accepted by
+  destination sockets. Pipe bytes are NEVER treated as delivered on input.
+- `EPOLLIN` pauses while that direction has bytes in its pipe or preconnect
+  queue; destination `EPOLLOUT` is registered only for pending output.
+- TCP FIN (`shutdown(SHUT_WR)`) is delayed until both preconnect data and pipe
+  bytes have drained, preserving full-duplex and half-close behavior.
+- The proxy ignores `SIGPIPE` so a peer closing during `splice(pipe -> socket)`
+  does not terminate the entire multi-client process; `EPIPE` is handled locally.
+- A test-only syscall observer now audits both `socket -> pipe` and
+  `pipe -> socket` calls; tests validate byte integrity and accounting.
 
 ## Fedora prerequisites
 
 ```bash
 sudo dnf install gcc make python3 git unzip
-# Optional inspection commands:
-sudo dnf install strace iproute nmap-ncat
+sudo dnf install strace iproute nmap-ncat # optional debugging
 ```
 
-## Apply Phase 11 over Phase 10
+## Apply the ZIP over your Phase 11 checkout
 
 ```bash
 cd /path/to/splice-load-balancer
-unzip -l ~/Downloads/phase11_changes.zip
-unzip -o ~/Downloads/phase11_changes.zip -d .
+unzip -l ~/Downloads/phase12_changes.zip
+unzip -o ~/Downloads/phase12_changes.zip -d .
 make clean
 make
 make test
 ```
 
-Expected last line:
+Expected final line:
 
 ```text
-PASS: Phase 11 direction state and client-to-pipe splice test suite
+PASS: Phase 12 complete bidirectional splice transfer test suite
 ```
 
-Focused testing (after `make`):
+Focused new test:
 
 ```bash
-python3 tests/test_client_splice.py
+python3 tests/test_full_splice.py
 ```
 
-## Manual forwarding test - three terminals
+The test runs a real proxy + backend and uses a test-only `LD_PRELOAD` library
+that passes every call to the **real Linux syscall**. It verifies both hop
+families, preconnect staging, two 1 MiB binary transfers, and a backend that
+half-closes its write direction before the client finishes sending.
+
+## Manual smoke test (three terminals)
 
 ```bash
-# Terminal A: test echo backend
+# Terminal A: backend
 make backend-multi
 # Terminal B: proxy
 make run
 # Terminal C: client
-./build/backend-client 127.0.0.1 9090 "hello phase 11"
+./build/backend-client 127.0.0.1 9090 "hello phase 12"
 ```
 
-The client prints `hello phase 11`. The proxy remains running after the
-connection ends and its log includes a `client-to-pipe=N bytes` counter.
-For tiny requests, the count may be **0** because Phase 8's preconnect buffer
-can absorb the full request before the backend connection is ready. The
-focused 512 KiB automated test guarantees that live `splice()` occurs.
+Expected client output: `hello phase 12`. A small message might be handled
+entirely by preconnect staging: use the 1 MiB focused test to **prove** real
+`splice()` calls. The proxy remains listening after a session ends.
 
-To see the exact kernel calls, run the proxy through `strace` in Terminal B:
+Inspect real splice calls (restart Terminal B with this command):
 
 ```bash
-strace -e trace=splice,read,sendto,epoll_ctl,epoll_wait \
+strace -f -e trace=splice,epoll_ctl,epoll_wait,shutdown \
   ./build/splice-lb 9090 127.0.0.1 9091
 ```
 
-`strace` writes syscall traces to stderr. Look for `splice(client_fd, NULL,
-pipe_write_fd, NULL, count, SPLICE_F_MOVE|SPLICE_F_NONBLOCK)` followed by
-`read(pipe_read_fd, ...)` and `sendto(backend_fd, ...)`. Use a large client
-payload to bypass preconnect staging. `strace` affects scheduling; do not use
-it for performance benchmarks. The focused test uses `LD_PRELOAD` to audit
-successful `splice()` calls reliably without relying on trace timing.
+Use `ss -ltn '( sport = :9090 )'` to confirm the TCP listener exists. `strace`
+adds syscall overhead: do **not** use its timings as throughput numbers.
 
-## Data-path design and limitations
+## Current data paths
 
 ```text
-client socket --splice()--> [kernel pipe] --read()--> [64 KiB queue]
-                                                     --send()--> backend socket
-backend socket --recv()--> [64 KiB queue] --send()--> client socket
+client socket --splice()--> [pipe_to_backend] --splice()--> backend socket
+backend socket --splice()--> [pipe_to_client]  --splice()--> client socket
+
+Before backend READY only:
+client socket --recv()--> [max 8 KiB preconnect buffer] --send()--> backend
 ```
 
-`pipe_pending` tracks bytes in the kernel pipe; `pending` tracks bytes in the
-application queue. Total delivery accounting increments only after successful
-`send()` to the backend. `EPOLLOUT` remains demand-driven. The test shims are
-not linked into the proxy; they are compiled only inside the Python test.
+A successful first splice only means bytes have entered the kernel pipe;
+`forwarded` increments when the second splice successfully passes bytes to the
+destination kernel socket. This avoids routine userspace payload copies during
+READY-state forwarding; it does **not** prove that the kernel made absolutely
+zero internal copies, nor that throughput increased. Profile and benchmark
+later in the roadmap.
 
-Phase 11 is a correctness checkpoint, not a throughput improvement claim:
-there is still a kernel-to-user copy and user-to-kernel send. Full `splice()`
-forwarding, zero-copy claims, two-way backpressure, and performance
-benchmarking belong to later phases.
+**Known Phase 12 limitations:** the relay permits one outstanding pipe chunk
+per direction rather than fully exploiting pipe capacity; Phases 13-14 develop
+partial pipe-fill/pipe-drain `EAGAIN` behavior and event-interest transitions.
+Resource limits, failures, timeouts, load balancing, and performance measurement
+are covered in subsequent phases.
 
-## Source changes and personal learning notes
+## Files changed in this phase
 
-- `src/main.c`: state, socket-to-pipe splice, pipe-to-buffer drain, EOF gating.
-- `tests/splice_observer.c`: test-only syscall audit shim.
-- `tests/test_client_splice.py`: 512 KiB integrity, delayed connect and EOF.
-- `Makefile`: include the Phase 11 tests.
-- `README.md`, `progress.md`: instructions and learning checklist.
+- `src/main.c`: bidirectional splice datapath and SIGPIPE safety.
+- `tests/splice_observer.c`: audit pipe-to-socket as well as socket-to-pipe.
+- `tests/test_client_splice.py`: preserve Phase 11 assertions for both paths.
+- `tests/test_full_splice.py`: new end-to-end bidirectional syscall/integrity tests.
+- `Makefile`: include new test with `make test`.
+- `README.md`, `progress.md`: instructions and progress.
 
-`phase11_learning_guide.pdf` is kept **outside this repository and ZIP**.
+Keep `phase12_learning_guide.pdf` **outside the repository**; it is not in the ZIP.
 
 ---
 
