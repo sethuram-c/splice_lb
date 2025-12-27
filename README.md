@@ -1,3 +1,104 @@
+# Splice Load Balancer - Phase 13
+
+**Phase 13: partial transfers and pipe-fill `EAGAIN`.** Fedora Linux / C11.
+This is a change-only phase over Phase 12: two-hop `splice()` forwarding,
+nonblocking TCP connections, and all previous tests remain supported.
+
+## Changes introduced in Phase 13
+
+- Use a **bounded pipe-fill loop**, requesting at most the remaining amount
+  of a 64 KiB per-dispatch limit. Each positive `splice()` return is counted
+  as that many bytes, **not** the requested byte count.
+- Retry interrupted transfers (`EINTR`), distinguish stream EOF (`0`),
+  and treat `EAGAIN` as a nonfatal readiness condition.
+- If the pipe still contains bytes when socket-to-pipe `splice()` stops,
+  attempt to drain it to the destination socket; stop reading from the source
+  while pipe bytes are pending. The destination `EPOLLOUT` interest resumes
+  draining if the socket cannot accept data now.
+- Add per-direction counters: `partial-pipe-writes` and `pipe-write-EAGAIN`.
+  The EAGAIN counter increments when a socket-to-pipe call returns EAGAIN
+  with bytes already in the pipe; it alone does **not** prove the pipe is full.
+- Add a **test-only** LD_PRELOAD probe that reduces each pipe to 4096 bytes
+  using `F_SETPIPE_SZ` and records real short `splice()` returns and EAGAIN
+  while `FIONREAD` confirms unread source-socket bytes.
+- Confirm 1 MiB of exact binary data in **both directions**, plus all old
+  test suites. `src/main.c` has no dependency on the test probe.
+
+## Fedora prerequisites
+
+```bash
+sudo dnf install gcc make python3 git unzip
+# Optional command-line inspection:
+sudo dnf install strace iproute nmap-ncat
+```
+
+## Apply only the changed files over your Phase 12 repository
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase13_changes.zip
+unzip -o ~/Downloads/phase13_changes.zip -d .
+make clean
+make
+make test
+```
+
+Expected last line:
+
+```text
+PASS: Phase 13 partial transfers and pipe-fill EAGAIN test suite
+```
+
+Focused test, with the production server already built:
+
+```bash
+python3 tests/test_pipe_fill.py
+```
+
+To inspect your actual TCP listener and `splice()` kernel calls:
+
+```bash
+# In three different terminals:
+make backend-multi
+make run
+./build/backend-client 127.0.0.1 9090 'hello phase 13'
+
+# Optionally restart proxy under a syscall tracer:
+strace -f -e trace=splice,epoll_ctl,epoll_wait,shutdown \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+**Test-only versus product behavior:** The probe is compiled as a temporary
+`.so` by `tests/test_pipe_fill.py` and is loaded **only into the test proxy**.
+It changes pipe sizes to reproduce the edge case reliably. Normal `make run`
+uses whatever pipe capacity the Linux kernel chooses. To prove a *pipe-full*
+EAGAIN rather than just an empty input socket, the probe checks that unread
+bytes remain in the input socket via `ioctl(FIONREAD)`.
+
+**Invariants:** Each direction has its own pipe. Bytes in `pipe_pending` are
+not counted as forwarded. Preconnect `recv()` bytes are delivered first; TCP
+FIN is propagated only after the pending user queue and pipe are empty.
+The source `EPOLLIN` stays disabled while a pipe is occupied.
+
+**Remaining work:** Phase 14 refines pipe-drain `EAGAIN` and event-interest
+updates. This phase does not claim higher throughput, 10,000 clients, or
+complete elimination of all possible internal kernel copies.
+
+## Files changed in this phase
+
+- `src/main.c`
+- `tests/pipe_fill_probe.c` (test-only)
+- `tests/test_pipe_fill.py`
+- `Makefile`
+- `README.md`
+- `progress.md`
+
+Keep `phase13_learning_guide.pdf` **outside the repository**.
+
+---
+
+## Earlier phase notes (historical)
+
 # Splice Load Balancer - Phase 12
 
 **Phase 12: complete client-to-backend and reverse `splice()` paths.**

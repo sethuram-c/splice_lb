@@ -40,6 +40,10 @@ struct direction {
     size_t pipe_pending;
     uint64_t spliced_to_pipe;
     uint64_t spliced_from_pipe;
+    /* A successful splice may move less than requested. If EAGAIN follows
+     * while bytes remain in the pipe, the destination must drain first. */
+    uint64_t partial_pipe_writes;
+    uint64_t pipe_write_eagain;
     unsigned char buffer[COPY_BUFFER_SIZE];
     size_t offset;
     size_t pending;
@@ -202,12 +206,18 @@ static void remove_connection(struct server *server, struct connection *connecti
     printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
            "backend-to-client=%" PRIu64 " bytes; active=%zu; "
            "client-to-pipe=%" PRIu64 " bytes; backend-to-pipe=%" PRIu64
-           " bytes; pipe-to-backend=%" PRIu64 " bytes; pipe-to-client=%" PRIu64 " bytes\n",
+           " bytes; pipe-to-backend=%" PRIu64 " bytes; pipe-to-client=%" PRIu64
+           " bytes; partial-pipe-writes=%" PRIu64 "/%" PRIu64
+           "; pipe-write-EAGAIN=%" PRIu64 "/%" PRIu64 "\n",
            connection->to_backend.forwarded, connection->to_client.forwarded,
            server->active, connection->to_backend.spliced_to_pipe,
            connection->to_client.spliced_to_pipe,
            connection->to_backend.spliced_from_pipe,
-           connection->to_client.spliced_from_pipe);
+           connection->to_client.spliced_from_pipe,
+           connection->to_backend.partial_pipe_writes,
+           connection->to_client.partial_pipe_writes,
+           connection->to_backend.pipe_write_eagain,
+           connection->to_client.pipe_write_eagain);
     fflush(stdout);
     free(connection);
 }
@@ -281,36 +291,43 @@ static bool flush_spliced_direction(struct direction *direction) {
     return drain_pipe_to_socket(direction);
 }
 
-/* Basic nonblocking two-hop splice.  Keeping no more than one outstanding
- * pipe chunk makes ordering/backpressure clear at this milestone.  Later
- * phases expand the pipe-fill/pipe-drain readiness state handling. */
+/* Phase 13: socket -> pipe is a counted, bounded fill loop. splice() is
+ * allowed to move fewer bytes than requested, even when it succeeds. Keep
+ * filling until the kernel reports EAGAIN (source empty OR pipe unable to
+ * accept more), EOF, or the 64 KiB per-dispatch budget is reached. Only then
+ * drain the pipe into the destination. On a blocked destination, keep the
+ * exact occupancy and leave EPOLLIN disabled until EPOLLOUT drains it.
+ * Phase 14 will refine pipe-drain readiness and event-interest transitions. */
 static bool read_spliced_direction(struct direction *direction) {
     if (direction->source_eof) return true;
     if (!flush_spliced_direction(direction)) return false;
+    /* Staged preconnect bytes and pipe data precede later source bytes. */
     if (direction->pending != 0 || direction->pipe_pending != 0) return true;
-    for (;;) {
+
+    while (direction->pipe_pending < COPY_BUFFER_SIZE) {
+        const size_t requested = COPY_BUFFER_SIZE - direction->pipe_pending;
         ssize_t got = splice(direction->source, NULL,
                              direction->pipe_write_fd, NULL,
-                             COPY_BUFFER_SIZE,
-                             SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                             requested, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (got > 0) {
+            if ((size_t)got < requested) ++direction->partial_pipe_writes;
             direction->pipe_pending += (size_t)got;
             direction->spliced_to_pipe += (uint64_t)got;
-            if (!drain_pipe_to_socket(direction)) return false;
-            /* If the destination blocked, let EPOLLOUT drain the pipe
-             * before accepting another client/backend input chunk. */
-            if (direction->pipe_pending != 0) return true;
             continue;
         }
         if (got == 0) {
             direction->source_eof = true;
-            return finish_direction(direction);
+            break;
         }
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (direction->pipe_pending != 0) ++direction->pipe_write_eagain;
+            break;
+        }
         report_error("splice(socket -> pipe)");
         return false;
     }
+    return drain_pipe_to_socket(direction);
 }
 
 /* Staging must never send to a socket whose connect() is unfinished.

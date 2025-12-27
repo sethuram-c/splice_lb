@@ -53,6 +53,7 @@ test: all
 	python3 tests/test_splice_pipes.py
 	python3 tests/test_client_splice.py
 	python3 tests/test_full_splice.py
+	python3 tests/test_pipe_fill.py
 
 clean:
 	rm -rf build

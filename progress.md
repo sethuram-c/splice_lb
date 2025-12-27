@@ -110,4 +110,14 @@
   - [x] Audit both splice() hop directions with test-only LD_PRELOAD
   - [x] Verify full 1 MiB binary data in both directions, delayed backend, FIN
   - [x] Re-run all Phase 2-11 tests and test the Phase 11 ZIP merge sequence
-- [ ] Phase 13 - Partial transfers and pipe-fill EAGAIN
+- [x] Phase 13 - Partial transfers and pipe-fill EAGAIN
+  - [x] Fill each nonblocking direction pipe until EAGAIN, EOF or 64 KiB budget
+  - [x] Account successful partial splice calls using actual return values
+  - [x] Preserve pipe occupancy, never deliver FIN with pending bytes
+  - [x] Retry EINTR, handle EAGAIN without treating it as a fatal error
+  - [x] Track per-direction partial-splice and EAGAIN counters
+  - [x] Use test-only pipe2() interposer to force 4 KiB kernel pipe capacity
+  - [x] Prove real pipe-full EAGAIN with input socket FIONREAD > 0
+  - [x] Verify 1 MiB exact binary transfers in both directions
+  - [x] Re-run and pass every Phase 2-12 regression test
+- [ ] Phase 14 - Pipe-drain EAGAIN and event-interest updates
