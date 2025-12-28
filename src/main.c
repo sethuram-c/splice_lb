@@ -44,6 +44,11 @@ struct direction {
      * while bytes remain in the pipe, the destination must drain first. */
     uint64_t partial_pipe_writes;
     uint64_t pipe_write_eagain;
+    /* Phase 14: destination-side output readiness is independent of pipe fill.
+     * Pending pipe bytes survive EAGAIN until destination EPOLLOUT fires. */
+    bool drain_blocked;
+    uint64_t partial_pipe_drains;
+    uint64_t pipe_drain_eagain;
     unsigned char buffer[COPY_BUFFER_SIZE];
     size_t offset;
     size_t pending;
@@ -208,7 +213,9 @@ static void remove_connection(struct server *server, struct connection *connecti
            "client-to-pipe=%" PRIu64 " bytes; backend-to-pipe=%" PRIu64
            " bytes; pipe-to-backend=%" PRIu64 " bytes; pipe-to-client=%" PRIu64
            " bytes; partial-pipe-writes=%" PRIu64 "/%" PRIu64
-           "; pipe-write-EAGAIN=%" PRIu64 "/%" PRIu64 "\n",
+           "; pipe-write-EAGAIN=%" PRIu64 "/%" PRIu64
+           "; partial-pipe-drains=%" PRIu64 "/%" PRIu64
+           "; pipe-drain-EAGAIN=%" PRIu64 "/%" PRIu64 "\n",
            connection->to_backend.forwarded, connection->to_client.forwarded,
            server->active, connection->to_backend.spliced_to_pipe,
            connection->to_client.spliced_to_pipe,
@@ -217,7 +224,11 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_backend.partial_pipe_writes,
            connection->to_client.partial_pipe_writes,
            connection->to_backend.pipe_write_eagain,
-           connection->to_client.pipe_write_eagain);
+           connection->to_client.pipe_write_eagain,
+           connection->to_backend.partial_pipe_drains,
+           connection->to_client.partial_pipe_drains,
+           connection->to_backend.pipe_drain_eagain,
+           connection->to_client.pipe_drain_eagain);
     fflush(stdout);
     free(connection);
 }
@@ -259,16 +270,23 @@ static bool flush_direction(struct direction *direction) {
 /* Stage 8 KiB of preconnect client data in the existing application queue.
  * Those bytes MUST drain before later socket-to-pipe splice data: TCP is an
  * ordered stream, and sending the kernel-pipe bytes first would reorder it. */
+/* Keep the pipe's bytes intact when the destination socket is full. A
+ * nonblocking pipe-to-socket splice() may return EAGAIN even though the pipe
+ * has data: this time it is the destination that cannot accept more bytes.
+ * In that state, update_interests() must arm the destination's EPOLLOUT and
+ * DISARM the source EPOLLIN until the pipe has drained. */
 static bool drain_pipe_to_socket(struct direction *direction) {
     while (direction->pipe_pending != 0) {
+        size_t requested = direction->pipe_pending;
         ssize_t sent = splice(direction->pipe_read_fd, NULL,
                               direction->destination, NULL,
-                              direction->pipe_pending,
-                              SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                              requested, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (sent > 0) {
+            if ((size_t)sent < requested) ++direction->partial_pipe_drains;
             direction->pipe_pending -= (size_t)sent;
             direction->spliced_from_pipe += (uint64_t)sent;
             direction->forwarded += (uint64_t)sent;
+            direction->drain_blocked = false;
             continue;
         }
         if (sent == 0) {
@@ -276,10 +294,15 @@ static bool drain_pipe_to_socket(struct direction *direction) {
             return false;
         }
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            direction->drain_blocked = true;
+            ++direction->pipe_drain_eagain;
+            return true;
+        }
         report_error("splice(pipe -> socket)");
         return false;
     }
+    direction->drain_blocked = false;
     return finish_direction(direction);
 }
 
@@ -291,13 +314,13 @@ static bool flush_spliced_direction(struct direction *direction) {
     return drain_pipe_to_socket(direction);
 }
 
-/* Phase 13: socket -> pipe is a counted, bounded fill loop. splice() is
+/* Phase 13/14: socket -> pipe is a counted, bounded fill loop. splice() is
  * allowed to move fewer bytes than requested, even when it succeeds. Keep
  * filling until the kernel reports EAGAIN (source empty OR pipe unable to
  * accept more), EOF, or the 64 KiB per-dispatch budget is reached. Only then
  * drain the pipe into the destination. On a blocked destination, keep the
  * exact occupancy and leave EPOLLIN disabled until EPOLLOUT drains it.
- * Phase 14 will refine pipe-drain readiness and event-interest transitions. */
+ * Phase 14 tracks blocked pipe drains and arms output readiness on demand. */
 static bool read_spliced_direction(struct direction *direction) {
     if (direction->source_eof) return true;
     if (!flush_spliced_direction(direction)) return false;
@@ -357,32 +380,37 @@ static bool stage_client_data(struct connection *connection) {
     }
 }
 
+/* Level-triggered readiness state machine:
+ * - Source EPOLLIN: only when its direction has ZERO pending output.
+ * - Destination EPOLLOUT: only when queued data needs a retry (including
+ *   pipe data whose last drain returned EAGAIN).
+ * - Neither socket is busy-polled: the kernel wakes us on actual readiness.
+ * - The CONNECTING backend remains watched for EPOLLOUT until SO_ERROR.
+ * See tests/test_pipe_drain.py for the blocked -> resumed -> idle sequence. */
 static bool update_interests(struct server *server, struct connection *connection) {
     if (connection->backend_state == BACKEND_CONNECTING) {
-        /* EPOLLIN only while the staging buffer is empty: bounded backpressure.
-         * Keep EPOLLOUT on backend until SO_ERROR confirms completion. */
         uint32_t early_read = (!connection->to_backend.source_eof &&
                                connection->to_backend.pending == 0) ? EPOLLIN : 0;
         return change_interest(server, &connection->client, early_read) &&
                change_interest(server, &connection->backend, EPOLLOUT);
     }
-    uint32_t client_mask = 0, backend_mask = 0;
-    /* Disable input when either the staged queue or pipe is occupied:
-     * this bounds data per direction and preserves FIFO delivery. */
-    if (!connection->to_backend.source_eof &&
-        connection->to_backend.pipe_pending == 0 &&
-        connection->to_backend.pending == 0)
+    const struct direction *up = &connection->to_backend;
+    const struct direction *down = &connection->to_client;
+    uint32_t client_mask = 0;
+    uint32_t backend_mask = 0;
+
+    /* The output of 'down' is the client, the output of 'up' is backend. */
+    if (!up->source_eof && up->pending == 0 && up->pipe_pending == 0 &&
+        !up->drain_blocked)
         client_mask |= EPOLLIN;
-    if (!connection->to_client.source_eof &&
-        connection->to_client.pipe_pending == 0 &&
-        connection->to_client.pending == 0)
+    if (!down->source_eof && down->pending == 0 && down->pipe_pending == 0 &&
+        !down->drain_blocked)
         backend_mask |= EPOLLIN;
-    /* Demand-only EPOLLOUT: active while staged bytes OR kernel pipe bytes
-     * await forwarding to the destination TCP socket. */
-    if (connection->to_client.pending != 0 ||
-        connection->to_client.pipe_pending != 0) client_mask |= EPOLLOUT;
-    if (connection->to_backend.pending != 0 ||
-        connection->to_backend.pipe_pending != 0) backend_mask |= EPOLLOUT;
+    if (down->pending > 0 || down->pipe_pending > 0 || down->drain_blocked)
+        client_mask |= EPOLLOUT;
+    if (up->pending > 0 || up->pipe_pending > 0 || up->drain_blocked)
+        backend_mask |= EPOLLOUT;
+
     return change_interest(server, &connection->client, client_mask) &&
            change_interest(server, &connection->backend, backend_mask);
 }

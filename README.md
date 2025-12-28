@@ -1,3 +1,107 @@
+# Splice Load Balancer - Phase 14
+
+**Phase 14: pipe-drain `EAGAIN` and demand-driven `EPOLLOUT`.** Fedora Linux, C11.
+This is a change-only update to Phase 13; apply it over your current repository.
+
+## What changed in Phase 14
+
+- After `splice(pipe -> socket)` returns positive but fewer bytes than requested,
+  count the real partial drain and update `pipe_pending` by the returned amount.
+- After the same splice returns `EAGAIN`, **keep pending bytes in the pipe**,
+  mark that direction `drain_blocked`, and increment `pipe_drain_eagain`.
+  These events are distinct from Phase 13's `socket -> pipe` fill-side `EAGAIN`.
+- Explicitly compute `EPOLLIN` and `EPOLLOUT` interests for each socket:
+  source `EPOLLIN` stops when its outbound pipe/queue is occupied; destination
+  `EPOLLOUT` is enabled only while queued output needs another opportunity.
+- On a writable event, retry the blocked drain; clear `drain_blocked` when
+  progress occurs; once all data drain, remove `EPOLLOUT` and resume source
+  `EPOLLIN` without busy-spinning or treating `EAGAIN` as fatal.
+- Continue delaying a TCP half-close until **both** the preconnect staging
+  queue and the direction pipe are empty.
+- Add targeted tests that hold a real TCP peer's receive side idle, verify a
+  **real pipe-drain `EAGAIN`**, watch EPOLLOUT through `/proc/<pid>/fdinfo`,
+  resume delivery, confirm EPOLLOUT is disarmed while the sockets stay open,
+  and compare 8 MiB binary transfers byte-for-byte in **both** directions.
+
+## Install and verify on Fedora
+
+```bash
+sudo dnf install gcc make python3 git unzip
+# Optional diagnostics: sudo dnf install strace iproute nmap-ncat
+
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase14_changes.zip
+unzip -o ~/Downloads/phase14_changes.zip -d .
+make clean
+make
+make test
+```
+
+Expected Phase 14 tail:
+
+```text
+PASS: stalled client -> real pipe-drain EAGAIN -> EPOLLOUT retry -> idle disarm; 8 MiB intact
+PASS: stalled backend -> real pipe-drain EAGAIN -> EPOLLOUT retry -> idle disarm; 8 MiB intact
+PASS: Phase 14 pipe-drain EAGAIN and event-interest updates test suite
+```
+
+Focused run: `python3 tests/test_pipe_drain.py` (requires `make` first).
+
+## Manual three-terminal test
+
+```bash
+# Terminal 1
+make backend-multi
+# Terminal 2
+make run
+# Terminal 3
+./build/backend-client 127.0.0.1 9090 'hello phase 14'
+```
+
+Expected client output: `hello phase 14`.
+
+## Inspect runtime readiness and system calls
+
+```bash
+ss -ltn '( sport = :9090 or sport = :9091 )'
+PID=$(pidof splice-lb)
+ls -l /proc/$PID/fd
+# Identify the eventpoll fd in the listing, then:
+cat /proc/$PID/fdinfo/EPOLL_FD
+
+# Restart the proxy under strace if desired:
+strace -f -e trace=splice,epoll_ctl,epoll_wait,shutdown \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+`/proc/<pid>/fdinfo` epoll masks are in hexadecimal; `EPOLLOUT` is bit `0x4`.
+The targeted test checks masks while sockets stay open, avoiding the false
+positive of a watch disappearing simply because a connection closed.
+
+**Correctness invariants:** `spliced_to_pipe - spliced_from_pipe == pipe_pending`;
+no source read while that direction has undelivered data; do not send FIN until
+`pending == 0 && pipe_pending == 0`. `EAGAIN` is not TCP EOF. A writable
+notification is not permission to write forever: stop again at `EAGAIN`.
+
+**Limitations:** This phase is still a single-backend learning proxy. It does
+not yet add Round Robin/Least Connections, prove thousands of connections, or
+claim measured latency improvement. Phase 15 strengthens overall splice
+integration and systematic byte-integrity verification.
+
+## Files changed in Phase 14
+
+- `src/main.c`
+- `tests/test_pipe_drain.py`
+- `Makefile`
+- `README.md`
+- `progress.md`
+
+**Keep the personal `phase14_learning_guide.pdf` outside the Git repository.**
+
+---
+
+## Previous phases (archived)
+
 # Splice Load Balancer - Phase 13
 
 **Phase 13: partial transfers and pipe-fill `EAGAIN`.** Fedora Linux / C11.

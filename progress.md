@@ -120,4 +120,13 @@
   - [x] Prove real pipe-full EAGAIN with input socket FIONREAD > 0
   - [x] Verify 1 MiB exact binary transfers in both directions
   - [x] Re-run and pass every Phase 2-12 regression test
-- [ ] Phase 14 - Pipe-drain EAGAIN and event-interest updates
+- [x] Phase 14 - Pipe-drain EAGAIN and event-interest updates
+  - [x] Preserve pending kernel pipe bytes on pipe-to-socket EAGAIN
+  - [x] Count destination-side partial drains and actual EAGAIN returns
+  - [x] Track per-direction drain-blocked state independently of pipe fill
+  - [x] Arm destination EPOLLOUT only while staged or pipe data remain
+  - [x] Pause source EPOLLIN during blocked drains, resume after pipe empties
+  - [x] Verify EPOLLOUT is removed once data drains while the session stays open
+  - [x] Test stalled backend and stalled client, 8 MiB exact binary each way
+  - [x] Rerun complete Phase 2-13 test suite after changing event handling
+- [ ] Phase 15 - Integrate splice and verify byte integrity
