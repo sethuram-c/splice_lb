@@ -53,6 +53,9 @@ struct direction {
     size_t offset;
     size_t pending;
     uint64_t forwarded;
+    /* Bytes delivered through send() from the preconnect staging queue.
+     * Together with spliced_from_pipe, this must equal forwarded. */
+    uint64_t staged_sent;
     bool source_eof;
     bool destination_shutdown;
 };
@@ -200,6 +203,30 @@ static void close_connection_pipes(struct connection *connection) {
     }
 }
 
+/* Phase 15: a byte-counting invariant is not a content hash. It catches
+ * lost/double-counted bytes inside our two-hop forwarding state machine;
+ * byte-for-byte payload tests provide independent content verification. */
+static bool direction_accounting_valid(const struct direction *direction) {
+    return direction->spliced_from_pipe <= direction->spliced_to_pipe &&
+           direction->spliced_to_pipe - direction->spliced_from_pipe ==
+               (uint64_t)direction->pipe_pending &&
+           direction->forwarded ==
+               direction->staged_sent + direction->spliced_from_pipe;
+}
+
+static bool fully_forwarded(const struct connection *connection) {
+    const struct direction *up = &connection->to_backend;
+    const struct direction *down = &connection->to_client;
+    return connection->backend_state == BACKEND_READY &&
+           up->source_eof && down->source_eof &&
+           up->destination_shutdown && down->destination_shutdown &&
+           up->pending == 0 && down->pending == 0 &&
+           up->pipe_pending == 0 && down->pipe_pending == 0 &&
+           up->staged_sent == connection->preconnect_buffered &&
+           down->staged_sent == 0 &&
+           direction_accounting_valid(up) && direction_accounting_valid(down);
+}
+
 static void remove_connection(struct server *server, struct connection *connection) {
     struct connection **cursor = &server->connections;
     while (*cursor != NULL && *cursor != connection) cursor = &(*cursor)->next;
@@ -229,6 +256,14 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_client.partial_pipe_drains,
            connection->to_backend.pipe_drain_eagain,
            connection->to_client.pipe_drain_eagain);
+    printf("transfer-integrity=%s; staged=%" PRIu64 "; "
+           "pipe-pending=%zu/%zu; forwarded=%" PRIu64 "/%" PRIu64 "\n",
+           fully_forwarded(connection) ? "verified" : "incomplete",
+           connection->to_backend.staged_sent,
+           connection->to_backend.pipe_pending,
+           connection->to_client.pipe_pending,
+           connection->to_backend.forwarded,
+           connection->to_client.forwarded);
     fflush(stdout);
     free(connection);
 }
@@ -253,6 +288,7 @@ static bool flush_direction(struct direction *direction) {
             direction->offset += (size_t)written;
             direction->pending -= (size_t)written;
             direction->forwarded += (uint64_t)written;
+            direction->staged_sent += (uint64_t)written;
         } else if (written < 0 && errno == EINTR) {
             continue;
         } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -558,6 +594,11 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     if (flags & EPOLLOUT) ok = flush_spliced_direction(outgoing);
     if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))) {
         ok = read_spliced_direction(incoming);
+    }
+    if (ok && (!direction_accounting_valid(&connection->to_backend) ||
+               !direction_accounting_valid(&connection->to_client))) {
+        fputs("splice accounting invariant failed\n", stderr);
+        ok = false;
     }
     if (ok && incoming->destination_shutdown && outgoing->destination_shutdown) {
         remove_connection(server, connection);

@@ -1,3 +1,77 @@
+# Splice Load Balancer - Phase 15
+
+**Phase 15: integrated bidirectional `splice()` with end-to-end byte-integrity verification.** Fedora Linux / C11. This patch applies **over Phase 14**; it is not a standalone project archive.
+
+## What changed
+
+- The established client -> pipe -> backend and backend -> pipe -> client transfer paths remain the primary ready-state relay. Early client bytes still use the preconnect 8 KiB `recv()/send()` staging path, preserving TCP ordering.
+- Added `staged_sent` per direction; `forwarded` now has a verifiable decomposition: `staged_sent + spliced_from_pipe == forwarded`.
+- Check the live pipe-occupancy equation at each event dispatch: `spliced_to_pipe - spliced_from_pipe == pipe_pending`. A failed check closes only that connection and prints a diagnostic.
+- Print `transfer-integrity=verified` only for cleanly completed full-duplex sessions after both EOFs, both write-side shutdowns, fully drained buffers/pipes, and balanced counters. Aborted/incomplete sessions print `transfer-integrity=incomplete` **without** claiming successful delivery.
+- Added `tests/test_splice_integrity.py`: 12 concurrent binary TCP streams (0 to 3 MiB+), intentionally irregular fragmentation, simultaneous upload/echo, exact payload comparison, SHA-256 equality, and accounting/log assertions.
+- Kept every test from Phases 2-14 and included the Phase 15 test in `make test`.
+
+**Important:** A passing *counter invariant* is a consistency check, **not a cryptographic proof** that content is correct. The separate end-to-end payload comparisons establish byte integrity in the tests. `splice()` reduces userspace copying but does not promise an entirely copy-free physical TCP/NIC data path on every system.
+
+## Apply this changed-files ZIP over Phase 14
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase15_changes.zip
+unzip -o ~/Downloads/phase15_changes.zip -d .
+make clean
+make
+make test
+```
+
+Focused run (after building):
+
+```bash
+python3 tests/test_splice_integrity.py
+```
+
+Expected concluding test lines:
+
+```text
+PASS: 12 concurrent streaming TCP sessions; 4677783 binary bytes each direction, byte-exact SHA-256
+PASS: 0/1/8192/65536-byte boundaries and 3 MiB+ payload preserved
+PASS: 12 completed sessions have consistent pipe/staged/forwarded accounting
+PASS: Phase 15 splice integration and byte-integrity test suite
+```
+
+Manual check in three terminals:
+
+```bash
+# Terminal A
+make backend-multi
+# Terminal B
+make run
+# Terminal C
+./build/backend-client 127.0.0.1 9090 'hello phase 15'
+```
+
+Terminal B should print `transfer-integrity=verified` when the client finishes normally.
+To inspect kernel syscalls, stop the normal proxy and run:
+
+```bash
+strace -f -e trace=splice,epoll_ctl,epoll_wait,shutdown \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+Potential test/environment constraints: local loopback bind must be allowed; Linux `/proc` must be mounted for earlier introspection tests. No root access is required for normal tests. The new test is a correctness exercise, **not** proof of 1,000+ supported clients, comparative latency, or end-to-end zero CPU copies; those appear in later phases.
+
+## Phase 15 changed files
+
+- `src/main.c`
+- `tests/test_splice_integrity.py`
+- `Makefile`
+- `README.md`
+- `progress.md`
+
+**Keep `phase15_learning_guide.pdf` outside the Git repository.**
+
+---
+
 # Splice Load Balancer - Phase 14
 
 **Phase 14: pipe-drain `EAGAIN` and demand-driven `EPOLLOUT`.** Fedora Linux, C11.

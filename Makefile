@@ -55,6 +55,7 @@ test: all
 	python3 tests/test_full_splice.py
 	python3 tests/test_pipe_fill.py
 	python3 tests/test_pipe_drain.py
+	python3 tests/test_splice_integrity.py
 
 clean:
 	rm -rf build

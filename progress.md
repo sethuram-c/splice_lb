@@ -130,3 +130,13 @@
   - [x] Test stalled backend and stalled client, 8 MiB exact binary each way
   - [x] Rerun complete Phase 2-13 test suite after changing event handling
 - [ ] Phase 15 - Integrate splice and verify byte integrity
+
+- [x] Phase 15 - Integrate splice() and verify byte integrity
+  - [x] Preserve two independent socket -> pipe -> socket splice paths
+  - [x] Track preconnect staged bytes separately from pipe-forwarded bytes
+  - [x] Check runtime pipe occupancy and forwarded-byte accounting equations
+  - [x] Mark only fully drained, bidirectionally closed sessions as verified
+  - [x] Compare exact contents and SHA-256 digests for twelve concurrent streams
+  - [x] Cover boundary sizes 0/1/8192/65536 and a 3 MiB+ request
+  - [x] Run complete Phase 2-15 regression suite with strict GCC warnings
+  - [x] Keep private learning PDF outside the repository
