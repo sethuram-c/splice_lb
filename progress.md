@@ -140,3 +140,16 @@
   - [x] Cover boundary sizes 0/1/8192/65536 and a 3 MiB+ request
   - [x] Run complete Phase 2-15 regression suite with strict GCC warnings
   - [x] Keep private learning PDF outside the repository
+
+- [x] Phase 16 - Backend list and Round Robin selection
+  - [x] Maintain 1-32 IPv4 backend addresses and per-backend selection counts
+  - [x] Preserve three-argument legacy proxy startup for existing tests
+  - [x] Parse new `IPv4:port` backend list with strict error handling
+  - [x] Select next target once per accepted TCP connection
+  - [x] Keep backend choice stable throughout nonblocking connect and splice forwarding
+  - [x] Reject malformed addresses, invalid ports, and oversized backend lists
+  - [x] Verify deterministic 0/1/2 cycling over 12 sequential connections
+  - [x] Verify 30 concurrent sessions distribute 10/10/10 and preserve bytes
+  - [x] Audit logged choices and completed-session integrity counters
+  - [x] Pass all previous Phase 2-15 regression tests
+  - [x] Keep personal learning PDF outside repo

@@ -1,3 +1,87 @@
+# Splice Load Balancer - Phase 16: Round Robin Backends
+
+Fedora Linux / C11 / Linux `epoll` and `splice()`.
+**This is a changed-files patch to apply over Phase 15** - do not start a new repository.
+
+## New in Phase 16
+
+- The proxy now supports up to **32 IPv4:port backend targets** in a fixed backend table.
+- TCP clients are assigned **once on acceptance** using a round-robin cursor:
+  `selected = next_backend; next_backend = (next_backend + 1) % count`.
+- Each connection holds its chosen backend index; a backend TCP connection can
+  be pending, and selection does not change when it finishes or disconnects.
+- The existing old command (`./build/splice-lb 9090 127.0.0.1 9091`) still
+  works, retaining Phase 2-15 regression compatibility.
+- A new command specifies one or more backends:
+
+```bash
+./build/splice-lb 9090 127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+- New per-accept logs show `Selected backend[0]=127.0.0.1:9091` and the
+  cumulative selection count. These counts are selections, **not** active
+  backend connections (Least Connections is Phase 17).
+- **No retry/failover yet:** if a selected backend is down, that client fails;
+  the next accepted client still rotates onward. Failure policy is Phase 19.
+- The live binary transfer path is still two-hop `splice()` with independent
+  pipes in both directions; no application HTTP parsing is introduced.
+
+## Apply and verify on Fedora
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase16_changes.zip
+unzip -o ~/Downloads/phase16_changes.zip -d .
+make clean
+make
+make test
+python3 tests/test_round_robin.py
+```
+
+The new tests spin up three ephemeral tagged TCP backends, validate 12
+sequential exact round-robin assignments, exercise 30 concurrent clients
+(10 selections each), verify 43 connection-integrity logs, and reject invalid
+backend configurations. **All earlier tests run in `make test`.**
+
+## Manual check - three terminals
+
+```bash
+# Terminal 1 - start three identifiable local TCP backends
+make backend-rr
+
+# Terminal 2 - proxy listening on loopback 9090
+./build/splice-lb 9090 127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+
+# Terminal 3 - run multiple times, once per connection
+./build/backend-client 127.0.0.1 9090 'hello phase 16'
+./build/backend-client 127.0.0.1 9090 'hello phase 16'
+./build/backend-client 127.0.0.1 9090 'hello phase 16'
+```
+
+Expected client responses start with `backend-0|`, `backend-1|`, and
+`backend-2|` respectively; every response includes your original message.
+If ports 9090-9093 are occupied, stop the other services or choose free ports
+for the backends and corresponding proxy command.
+
+Debug with `ss -ltn '( sport = :9090 or sport = :9091 or sport = :9092 or sport = :9093 )'`
+or use `strace -f -e trace=connect,epoll_wait,splice ./build/splice-lb 9090 ...`
+to observe nonblocking backend connection setup and live forwarding.
+`python3 tests/test_round_robin.py` uses random free test ports to avoid
+collisions. No root privileges are required for these local tests.
+
+## Files changed in this phase
+
+- `src/main.c`
+- `tests/rr_backends.py`
+- `tests/test_round_robin.py`
+- `Makefile`
+- `README.md`
+- `progress.md`
+
+**Keep `phase16_learning_guide.pdf` outside the Git repository.**
+
+---
+
 # Splice Load Balancer - Phase 15
 
 **Phase 15: integrated bidirectional `splice()` with end-to-end byte-integrity verification.** Fedora Linux / C11. This patch applies **over Phase 14**; it is not a standalone project archive.

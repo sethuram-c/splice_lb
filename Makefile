@@ -36,6 +36,10 @@ backend: $(ECHO)
 backend-multi:
 	python3 tests/backend_multi.py 9091
 
+.PHONY: backend-rr
+backend-rr:
+	python3 tests/rr_backends.py 9091 9092 9093
+
 .PHONY: backend-multi
 
 run: $(SERVER)
@@ -56,6 +60,7 @@ test: all
 	python3 tests/test_pipe_fill.py
 	python3 tests/test_pipe_drain.py
 	python3 tests/test_splice_integrity.py
+	python3 tests/test_round_robin.py
 
 clean:
 	rm -rf build

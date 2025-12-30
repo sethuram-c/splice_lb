@@ -20,6 +20,13 @@
 #define COPY_BUFFER_SIZE 65536U
 #define PRECONNECT_BUFFER_SIZE 8192U
 #define EVENT_BATCH 64
+#define MAX_BACKENDS 32U
+
+struct backend_target {
+    struct sockaddr_in address;
+    char label[INET_ADDRSTRLEN + 8];
+    uint64_t selections;
+};
 
 struct connection;
 struct endpoint {
@@ -64,6 +71,7 @@ enum backend_state { BACKEND_CONNECTING, BACKEND_READY };
 struct connection {
     enum backend_state backend_state;
     size_t preconnect_buffered; /* client bytes staged before SO_ERROR success */
+    size_t backend_index; /* stable for this connection until cleanup */
     struct connection *next;
     struct endpoint client;
     struct endpoint backend;
@@ -76,7 +84,9 @@ struct connection {
 struct server {
     int listener;
     int epoll_fd;
-    struct sockaddr_in backend_address;
+    struct backend_target backends[MAX_BACKENDS];
+    size_t backend_count;
+    size_t next_backend; /* next index for connection-level round robin */
     struct connection *connections;
     struct endpoint **by_fd;
     size_t fd_capacity;
@@ -97,6 +107,37 @@ static bool parse_port(const char *text, bool allow_zero, uint16_t *port) {
     }
     *port = (uint16_t)value;
     return true;
+}
+
+/* Explicit backend spec is IPv4:port (no DNS or IPv6 in Phase 16).
+ * Keep the original three-argument CLI form for older regression tests. */
+static bool parse_backend_spec(const char *text, struct backend_target *target) {
+    const char *colon = strchr(text, ':');
+    if (colon == NULL || strchr(colon + 1, ':') != NULL) return false;
+    size_t ip_length = (size_t)(colon - text);
+    if (ip_length == 0 || ip_length >= INET_ADDRSTRLEN) return false;
+    char ip[INET_ADDRSTRLEN];
+    memcpy(ip, text, ip_length);
+    ip[ip_length] = '\0';
+    uint16_t port;
+    if (!parse_port(colon + 1, false, &port) ||
+        inet_pton(AF_INET, ip, &target->address.sin_addr) != 1) return false;
+    target->address.sin_family = AF_INET;
+    target->address.sin_port = htons(port);
+    (void)snprintf(target->label, sizeof(target->label), "%s:%u",
+                   ip, (unsigned)port);
+    target->selections = 0;
+    return true;
+}
+
+/* Selection is per accepted TCP connection (not per packet or byte).
+ * An attempted failed connection still consumes its turn. Health-aware
+ * retries are intentionally deferred until Phase 19. */
+static size_t select_backend(struct server *server) {
+    size_t chosen = server->next_backend;
+    server->next_backend = (chosen + 1U) % server->backend_count;
+    ++server->backends[chosen].selections;
+    return chosen;
 }
 
 static void report_error(const char *call) {
@@ -467,6 +508,12 @@ static bool attach_connection(struct server *server, int client) {
     connection->client.is_client = true;
     connection->client.owner = connection;
     connection->backend.owner = connection;
+    connection->backend_index = select_backend(server);
+    const struct backend_target *target = &server->backends[connection->backend_index];
+    printf("Selected backend[%zu]=%s; selections=%" PRIu64 "\n",
+           connection->backend_index, target->label,
+           server->backends[connection->backend_index].selections);
+    fflush(stdout);
     if (!set_nonblocking(client)) goto fail;
     connection->backend.fd = socket(AF_INET, SOCK_STREAM, 0);
     if (connection->backend.fd < 0) {
@@ -477,8 +524,8 @@ static bool attach_connection(struct server *server, int client) {
      * can stall the whole epoll event loop. */
     if (!set_nonblocking(connection->backend.fd)) goto fail;
     int connect_result = connect(connection->backend.fd,
-                                 (const struct sockaddr *)&server->backend_address,
-                                 sizeof(server->backend_address));
+                                 (const struct sockaddr *)&target->address,
+                                 sizeof(target->address));
     if (connect_result == 0) {
         connection->backend_state = BACKEND_READY;
     } else if (errno == EINPROGRESS) {
@@ -623,18 +670,40 @@ int main(int argc, char **argv) {
         report_error("signal(SIGPIPE)");
         return EXIT_FAILURE;
     }
-    uint16_t listen_port, backend_port;
-    struct sockaddr_in backend = {0};
-    if (argc != 4 || !parse_port(argv[1], true, &listen_port) ||
-        !parse_port(argv[3], false, &backend_port) ||
-        inet_pton(AF_INET, argv[2], &backend.sin_addr) != 1) {
-        fprintf(stderr, "Usage: %s <listen-port: 0-65535> <backend-IPv4> "
-                        "<backend-port: 1-65535>\n", argv[0]);
-        return EXIT_FAILURE;
+    uint16_t listen_port;
+    struct server server = {.listener = -1, .epoll_fd = -1};
+    if (argc < 3 || !parse_port(argv[1], true, &listen_port)) goto usage;
+
+    if (argc == 4 && strchr(argv[2], ':') == NULL) {
+        /* Backwards compatibility: <listen-port> <IPv4> <backend-port>. */
+        uint16_t port;
+        struct sockaddr_in *backend = &server.backends[0].address;
+        if (!parse_port(argv[3], false, &port) ||
+            inet_pton(AF_INET, argv[2], &backend->sin_addr) != 1) goto usage;
+        backend->sin_family = AF_INET;
+        backend->sin_port = htons(port);
+        (void)snprintf(server.backends[0].label,
+                       sizeof(server.backends[0].label), "%s:%u",
+                       argv[2], (unsigned)port);
+        server.backend_count = 1;
+    } else {
+        /* New form: <listen-port> <IPv4:port> [<IPv4:port> ...]. */
+        if ((size_t)(argc - 2) > MAX_BACKENDS) goto usage;
+        for (int i = 2; i < argc; ++i) {
+            if (!parse_backend_spec(argv[i],
+                                    &server.backends[server.backend_count])) goto usage;
+            ++server.backend_count;
+        }
     }
-    backend.sin_family = AF_INET;
-    backend.sin_port = htons(backend_port);
-    struct server server = {.listener = -1, .epoll_fd = -1, .backend_address = backend};
+    goto parsed;
+usage:
+    fprintf(stderr, "Usage: %s <listen-port: 0-65535> "
+                    "<backend-IPv4> <backend-port: 1-65535>\n"
+                    "   or: %s <listen-port: 0-65535> "
+                    "<backend-IPv4:port> [backend-IPv4:port ...] (max %u)\n",
+            argv[0], argv[0], (unsigned)MAX_BACKENDS);
+    return EXIT_FAILURE;
+parsed: ;
     int result = EXIT_FAILURE;
     server.listener = socket(AF_INET, SOCK_STREAM, 0);
     if (server.listener < 0) { report_error("socket(listener)"); goto done; }
@@ -661,8 +730,15 @@ int main(int argc, char **argv) {
     struct epoll_event listener_event = {.events = EPOLLIN, .data.u64 = 0};
     if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, server.listener,
                   &listener_event) < 0) { report_error("epoll_ctl(listener)"); goto done; }
-    printf("Listening on 127.0.0.1:%u -> %s:%u\n",
-           (unsigned)ntohs(local.sin_port), argv[2], (unsigned)backend_port);
+    if (server.backend_count == 1) {
+        printf("Listening on 127.0.0.1:%u -> %s\n",
+               (unsigned)ntohs(local.sin_port), server.backends[0].label);
+    } else {
+        printf("Listening on 127.0.0.1:%u -> round-robin (%zu backends)\n",
+               (unsigned)ntohs(local.sin_port), server.backend_count);
+        for (size_t i = 0; i < server.backend_count; ++i)
+            printf("Backend[%zu]=%s\n", i, server.backends[i].label);
+    }
     fflush(stdout);
 
     struct epoll_event events[EVENT_BATCH];
