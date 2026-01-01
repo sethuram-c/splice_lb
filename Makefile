@@ -61,6 +61,7 @@ test: all
 	python3 tests/test_pipe_drain.py
 	python3 tests/test_splice_integrity.py
 	python3 tests/test_round_robin.py
+	python3 tests/test_least_connections.py
 
 clean:
 	rm -rf build

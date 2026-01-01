@@ -1,3 +1,88 @@
+# Splice Load Balancer - Phase 17: Least Connections
+
+Fedora Linux / C11 / Linux `epoll` and `splice()`. **This changed-files ZIP applies on top of Phase 16.**
+
+## New in Phase 17
+
+- **Least Connections** uses the current number of active TCP proxy sessions per backend, not historical selections or bytes transferred.
+- A session is counted as active after both endpoints/pipes and epoll registrations have succeeded, including while its backend handshake is `CONNECTING`; it stops counting when the connection is removed. Incomplete setup paths never increment the counters.
+- On equal loads a rotating cursor breaks ties rather than favoring backend 0.
+- Round Robin remains the default, and the old three-argument single-backend command still works. The new `--algorithm` prefix selects `least-connections` or `round-robin`.
+- A failed backend connection is closed with its active slot released. Phase 19 adds backend health/failover policy; this phase does not retry failed targets.
+- Existing nonblocking connect, `epoll`, two-pipe `splice()` paths, byte-integrity accounting, and half-closes are unchanged.
+
+## Commands
+
+```bash
+# Existing commands remain valid (default Round Robin):
+./build/splice-lb 9090 127.0.0.1 9091
+./build/splice-lb 9090 127.0.0.1:9091 127.0.0.1:9092
+
+# Select Least Connections, with three local backends:
+./build/splice-lb --algorithm least-connections 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+
+# Explicit Round Robin is also supported:
+./build/splice-lb --algorithm round-robin 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+## Apply and test on Fedora
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -o ~/Downloads/phase17_changes.zip -d .
+make clean
+make
+make test
+python3 tests/test_least_connections.py
+```
+
+The Phase 17 test uses three identifiable backend servers on available ephemeral loopback ports. It keeps clients connected while verifying 2/2/2 and 7/7/7 balances, disconnects selected clients to create unequal loads, and confirms that new clients choose the least-loaded backend. It also verifies accurate decrement-on-teardown and refused-connect handling. Earlier tests (Phases 2-16) are still run by `make test`.
+
+### Manual three-terminal demonstration
+
+```bash
+# Terminal 1: three tagged backend echo servers
+make backend-rr
+
+# Terminal 2: proxy
+./build/splice-lb --algorithm least-connections 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+
+# Terminal 3: sample TCP client (repeat)
+./build/backend-client 127.0.0.1 9090 "hello phase 17"
+```
+
+Note: these short sequential connections may rotate exactly as Round Robin; the distinctive Least Connections behavior requires **different numbers of simultaneously open clients**. Use `python3 tests/test_least_connections.py` to prove that difference. No root permissions are required for the local test.
+
+### Reading logs
+
+- `Selected backend[1]=...; selections=N; backend-active-before=M; algorithm=least-connections`: the backend had M live sessions immediately before the new selection.
+- `Released backend[1]=...; backend-active=M; total-active=T`: the connection released its target's active count, exactly once.
+- `transfer-integrity=verified` is emitted only when both directions drain and close cleanly; incomplete/abrupt connections are not counted as integrity successes.
+
+### Inspection and debugging
+
+```bash
+ss -ltn '( sport = :9090 or sport = :9091 or sport = :9092 or sport = :9093 )'
+ss -tnp '( sport = :9090 or dport = :9090 )'
+strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait,splice \
+  ./build/splice-lb --algorithm least-connections 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+`ss` shows kernel TCP sockets but **not the proxy's own backend counters**; consult selection/release logs and the automated tests for the scheduling policy. Do not put the separate `phase17_learning_guide.pdf` in the Git repository.
+
+## Changed/new files
+
+- `src/main.c` - per-backend active counts, least-connections selection, rotating tie-break, CLI switch, logs.
+- `tests/test_least_connections.py` - held-open connection assignment, concurrency, refusal, teardown and invalid-argument tests.
+- `Makefile` - run the focused test in `make test`.
+- `README.md` and `progress.md` - phase documentation.
+
+---
+
 # Splice Load Balancer - Phase 16: Round Robin Backends
 
 Fedora Linux / C11 / Linux `epoll` and `splice()`.

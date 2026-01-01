@@ -26,6 +26,7 @@ struct backend_target {
     struct sockaddr_in address;
     char label[INET_ADDRSTRLEN + 8];
     uint64_t selections;
+    size_t active_connections; /* CONNECTING and READY sessions, until teardown */
 };
 
 struct connection;
@@ -81,7 +82,10 @@ struct connection {
     struct direction to_backend;
     struct direction to_client;
 };
+enum balance_algorithm { BALANCE_ROUND_ROBIN, BALANCE_LEAST_CONNECTIONS };
+
 struct server {
+    enum balance_algorithm algorithm;
     int listener;
     int epoll_fd;
     struct backend_target backends[MAX_BACKENDS];
@@ -127,14 +131,27 @@ static bool parse_backend_spec(const char *text, struct backend_target *target) 
     (void)snprintf(target->label, sizeof(target->label), "%s:%u",
                    ip, (unsigned)port);
     target->selections = 0;
+    target->active_connections = 0;
     return true;
 }
 
-/* Selection is per accepted TCP connection (not per packet or byte).
- * An attempted failed connection still consumes its turn. Health-aware
- * retries are intentionally deferred until Phase 19. */
+/* Selection happens once per client, not per packet. In Least Connections,
+ * CONNECTING sockets count too, so a slow handshake does not attract all
+ * incoming clients. A rotating tie-break avoids always favoring backend[0].
+ * No health checks/retry policy yet: failed attempts consume a selection. */
 static size_t select_backend(struct server *server) {
     size_t chosen = server->next_backend;
+    if (server->algorithm == BALANCE_LEAST_CONNECTIONS) {
+        size_t minimum = server->backends[chosen].active_connections;
+        for (size_t step = 1; step < server->backend_count; ++step) {
+            size_t candidate = (server->next_backend + step) % server->backend_count;
+            size_t active = server->backends[candidate].active_connections;
+            if (active < minimum) {
+                minimum = active;
+                chosen = candidate;
+            }
+        }
+    }
     server->next_backend = (chosen + 1U) % server->backend_count;
     ++server->backends[chosen].selections;
     return chosen;
@@ -275,7 +292,15 @@ static void remove_connection(struct server *server, struct connection *connecti
     release_endpoint(server, &connection->client);
     release_endpoint(server, &connection->backend);
     close_connection_pipes(connection);
-    if (server->active > 0) --server->active;
+    /* The connection is added to the list only after all setup succeeds.
+     * Every listed connection owns exactly one active backend slot. */
+    struct backend_target *target = &server->backends[connection->backend_index];
+    if (target->active_connections == 0 || server->active == 0) {
+        fputs("active connection accounting underflow\n", stderr);
+        abort();
+    }
+    --target->active_connections;
+    --server->active;
     printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
            "backend-to-client=%" PRIu64 " bytes; active=%zu; "
            "client-to-pipe=%" PRIu64 " bytes; backend-to-pipe=%" PRIu64
@@ -305,6 +330,9 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_client.pipe_pending,
            connection->to_backend.forwarded,
            connection->to_client.forwarded);
+    printf("Released backend[%zu]=%s; backend-active=%zu; total-active=%zu\n",
+           connection->backend_index, target->label,
+           target->active_connections, server->active);
     fflush(stdout);
     free(connection);
 }
@@ -510,9 +538,11 @@ static bool attach_connection(struct server *server, int client) {
     connection->backend.owner = connection;
     connection->backend_index = select_backend(server);
     const struct backend_target *target = &server->backends[connection->backend_index];
-    printf("Selected backend[%zu]=%s; selections=%" PRIu64 "\n",
+    printf("Selected backend[%zu]=%s; selections=%" PRIu64
+           "; backend-active-before=%zu; algorithm=%s\n",
            connection->backend_index, target->label,
-           server->backends[connection->backend_index].selections);
+           target->selections, target->active_connections,
+           server->algorithm == BALANCE_LEAST_CONNECTIONS ? "least-connections" : "round-robin");
     fflush(stdout);
     if (!set_nonblocking(client)) goto fail;
     connection->backend.fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -554,6 +584,7 @@ static bool attach_connection(struct server *server, int client) {
     connection->next = server->connections;
     server->connections = connection;
     ++server->active;
+    ++server->backends[connection->backend_index].active_connections;
     if (connection->backend_state == BACKEND_READY)
         printf("Connected to backend; active=%zu\n", server->active);
     else
@@ -672,24 +703,37 @@ int main(int argc, char **argv) {
     }
     uint16_t listen_port;
     struct server server = {.listener = -1, .epoll_fd = -1};
-    if (argc < 3 || !parse_port(argv[1], true, &listen_port)) goto usage;
+    int arg = 1;
+    /* Phase 17 offers a focused selection switch. Phase 18 expands general
+     * configuration and comparison tests; old commands remain unchanged. */
+    if (argc >= 2 && strcmp(argv[1], "--algorithm") == 0) {
+        if (argc < 5) goto usage;
+        if (strcmp(argv[2], "least-connections") == 0) {
+            server.algorithm = BALANCE_LEAST_CONNECTIONS;
+        } else if (strcmp(argv[2], "round-robin") == 0) {
+            server.algorithm = BALANCE_ROUND_ROBIN;
+        } else {
+            goto usage;
+        }
+        arg = 3;
+    }
+    if (argc - arg < 2 || !parse_port(argv[arg], true, &listen_port)) goto usage;
 
-    if (argc == 4 && strchr(argv[2], ':') == NULL) {
-        /* Backwards compatibility: <listen-port> <IPv4> <backend-port>. */
+    if (argc - arg == 3 && strchr(argv[arg + 1], ':') == NULL) {
+        /* Compatibility: <listen-port> <IPv4> <backend-port>. */
         uint16_t port;
         struct sockaddr_in *backend = &server.backends[0].address;
-        if (!parse_port(argv[3], false, &port) ||
-            inet_pton(AF_INET, argv[2], &backend->sin_addr) != 1) goto usage;
+        if (!parse_port(argv[arg + 2], false, &port) ||
+            inet_pton(AF_INET, argv[arg + 1], &backend->sin_addr) != 1) goto usage;
         backend->sin_family = AF_INET;
         backend->sin_port = htons(port);
         (void)snprintf(server.backends[0].label,
                        sizeof(server.backends[0].label), "%s:%u",
-                       argv[2], (unsigned)port);
+                       argv[arg + 1], (unsigned)port);
         server.backend_count = 1;
     } else {
-        /* New form: <listen-port> <IPv4:port> [<IPv4:port> ...]. */
-        if ((size_t)(argc - 2) > MAX_BACKENDS) goto usage;
-        for (int i = 2; i < argc; ++i) {
+        if ((size_t)(argc - arg - 1) > MAX_BACKENDS) goto usage;
+        for (int i = arg + 1; i < argc; ++i) {
             if (!parse_backend_spec(argv[i],
                                     &server.backends[server.backend_count])) goto usage;
             ++server.backend_count;
@@ -700,7 +744,8 @@ usage:
     fprintf(stderr, "Usage: %s <listen-port: 0-65535> "
                     "<backend-IPv4> <backend-port: 1-65535>\n"
                     "   or: %s <listen-port: 0-65535> "
-                    "<backend-IPv4:port> [backend-IPv4:port ...] (max %u)\n",
+                    "<backend-IPv4:port> [backend-IPv4:port ...] (max %u)\n"
+                    "   optional prefix: --algorithm round-robin|least-connections\n",
             argv[0], argv[0], (unsigned)MAX_BACKENDS);
     return EXIT_FAILURE;
 parsed: ;
@@ -734,8 +779,10 @@ parsed: ;
         printf("Listening on 127.0.0.1:%u -> %s\n",
                (unsigned)ntohs(local.sin_port), server.backends[0].label);
     } else {
-        printf("Listening on 127.0.0.1:%u -> round-robin (%zu backends)\n",
-               (unsigned)ntohs(local.sin_port), server.backend_count);
+        printf("Listening on 127.0.0.1:%u -> %s (%zu backends)\n",
+               (unsigned)ntohs(local.sin_port),
+               server.algorithm == BALANCE_LEAST_CONNECTIONS ?
+               "least-connections" : "round-robin", server.backend_count);
         for (size_t i = 0; i < server.backend_count; ++i)
             printf("Backend[%zu]=%s\n", i, server.backends[i].label);
     }

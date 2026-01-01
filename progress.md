@@ -153,3 +153,14 @@
   - [x] Audit logged choices and completed-session integrity counters
   - [x] Pass all previous Phase 2-15 regression tests
   - [x] Keep personal learning PDF outside repo
+
+- [x] Phase 17 - Least Connections load balancing
+  - [x] Preserve Round Robin as default and legacy CLI compatibility
+  - [x] Parse an optional `--algorithm least-connections` selector
+  - [x] Maintain active connection count for every backend, including pending connects
+  - [x] Select least-loaded backend with a rotating tie breaker
+  - [x] Increment only after successful connection setup and decrement once in centralized cleanup
+  - [x] Release the active slot after backend connect refusal
+  - [x] Verify six held-open sessions at 2/2/2, then prefer an underloaded backend
+  - [x] Verify twenty-one parallel held sessions at 7/7/7 and all counters return to zero
+  - [x] Keep all earlier tests in `make test` and keep learning PDF outside the repository
