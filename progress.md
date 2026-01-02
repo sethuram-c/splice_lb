@@ -164,3 +164,14 @@
   - [x] Verify six held-open sessions at 2/2/2, then prefer an underloaded backend
   - [x] Verify twenty-one parallel held sessions at 7/7/7 and all counters return to zero
   - [x] Keep all earlier tests in `make test` and keep learning PDF outside the repository
+
+- [x] Phase 18 - Configurable algorithms and distribution verification
+  - [x] Support `--algorithm=NAME` in addition to Phase 17's `--algorithm NAME`
+  - [x] Add successful `--help` output, reject malformed/repeated algorithm choices
+  - [x] Preserve legacy positional CLI and Round Robin as the default
+  - [x] Start three real tagged backends and establish a controlled 2/2/0 load imbalance
+  - [x] Confirm Round Robin probe IDs 0/1/2 versus Least Connections 2/2/0
+  - [x] Verify exact echo payloads, nine completed sessions per algorithm and cleanup
+  - [x] Export optional comparison CSV outside the repo
+  - [x] Run strict GCC build, focused algorithm tests, and previous regressions
+  - [x] Keep the personal Phase 18 learning PDF outside Git

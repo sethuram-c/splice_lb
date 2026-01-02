@@ -704,18 +704,33 @@ int main(int argc, char **argv) {
     uint16_t listen_port;
     struct server server = {.listener = -1, .epoll_fd = -1};
     int arg = 1;
-    /* Phase 17 offers a focused selection switch. Phase 18 expands general
-     * configuration and comparison tests; old commands remain unchanged. */
-    if (argc >= 2 && strcmp(argv[1], "--algorithm") == 0) {
-        if (argc < 5) goto usage;
-        if (strcmp(argv[2], "least-connections") == 0) {
-            server.algorithm = BALANCE_LEAST_CONNECTIONS;
-        } else if (strcmp(argv[2], "round-robin") == 0) {
-            server.algorithm = BALANCE_ROUND_ROBIN;
-        } else {
-            goto usage;
-        }
+    /* Phase 18: accept both --algorithm NAME and --algorithm=NAME.
+     * Preserve legacy positional startup and reject repeated selectors. */
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+        printf("Usage: %s [--algorithm round-robin|least-connections] "
+               "<listen-port> <IPv4:port> [IPv4:port ...]\n"
+               "       %s <listen-port> <backend-IPv4> <backend-port>\n"
+               "       Alternative: --algorithm=round-robin|least-connections\n"
+               "       --help displays this message; listen port 0 picks a free port.\n",
+               argv[0], argv[0]);
+        return EXIT_SUCCESS;
+    }
+    const char *requested_algorithm = NULL;
+    if (argc > 1 && strcmp(argv[1], "--algorithm") == 0) {
+        if (argc < 3) goto usage;
+        requested_algorithm = argv[2];
         arg = 3;
+    } else if (argc > 1 && strncmp(argv[1], "--algorithm=", 12) == 0) {
+        requested_algorithm = argv[1] + 12;
+        arg = 2;
+    }
+    if (requested_algorithm != NULL) {
+        if (strcmp(requested_algorithm, "least-connections") == 0)
+            server.algorithm = BALANCE_LEAST_CONNECTIONS;
+        else if (strcmp(requested_algorithm, "round-robin") == 0)
+            server.algorithm = BALANCE_ROUND_ROBIN;
+        else
+            goto usage;
     }
     if (argc - arg < 2 || !parse_port(argv[arg], true, &listen_port)) goto usage;
 
@@ -745,7 +760,9 @@ usage:
                     "<backend-IPv4> <backend-port: 1-65535>\n"
                     "   or: %s <listen-port: 0-65535> "
                     "<backend-IPv4:port> [backend-IPv4:port ...] (max %u)\n"
-                    "   optional prefix: --algorithm round-robin|least-connections\n",
+                    "   optional prefix: --algorithm round-robin|least-connections\n"
+                    "   or: --algorithm=round-robin|least-connections\n"
+                    "   for help: --help\n",
             argv[0], argv[0], (unsigned)MAX_BACKENDS);
     return EXIT_FAILURE;
 parsed: ;

@@ -62,6 +62,7 @@ test: all
 	python3 tests/test_splice_integrity.py
 	python3 tests/test_round_robin.py
 	python3 tests/test_least_connections.py
+	python3 tests/test_algorithm_comparison.py
 
 clean:
 	rm -rf build

@@ -1,3 +1,81 @@
+# Splice Load Balancer - Phase 18: Algorithm Configuration and Distribution Comparison
+
+Fedora Linux / C11 / `epoll` / `splice()`. **Apply this Phase 18 changed-files ZIP over Phase 17.**
+
+## New in Phase 18
+
+- Accept both `--algorithm NAME` and `--algorithm=NAME`, with `round-robin` and `least-connections` as the only supported names; default remains Round Robin.
+- `./build/splice-lb --help` prints usage and exits successfully. Malformed options, duplicate algorithm selectors, invalid backend specifications and unknown algorithms fail with `Usage:` on stderr.
+- `tests/test_algorithm_comparison.py` starts three real identifiable TCP backends, creates a controlled 2/2/0 active-load imbalance, and compares the **next three** placements under both algorithms.
+- Tests assert the selected backend, echoed bytes, completed-session accounting and final active load; `--csv /tmp/phase18-distribution.csv` optionally exports all six probe choices for personal analysis outside the repository.
+- Phase 18 does not add health checks, weighted balancing or benchmark throughput. Results are a deterministic demonstration of active-connection fairness on this test workload, not proof of performance wins.
+
+## Fedora instructions
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -o ~/Downloads/phase18_changes.zip -d .
+make clean
+make
+make test
+python3 tests/test_algorithm_comparison.py
+python3 tests/test_algorithm_comparison.py --csv /tmp/phase18-distribution.csv
+cat /tmp/phase18-distribution.csv
+```
+
+Expected focused test output (backend ports are chosen dynamically):
+
+```text
+PASS: --help and 7 invalid configuration cases
+PASS: round-robin: probes=[0, 1, 2]; active={0: 3, 1: 3, 2: 1}; 9 sessions byte-exact
+PASS: least-connections: probes=[2, 2, 0]; active={0: 3, 1: 2, 2: 2}; 9 sessions byte-exact
+PASS: Least Connections improves active-load spread over Round Robin under skew
+PASS: Phase 18 configuration and algorithm comparison test suite
+```
+
+## CLI examples
+
+```bash
+./build/splice-lb --help
+./build/splice-lb 9090 127.0.0.1 9091
+./build/splice-lb 9090 127.0.0.1:9091 127.0.0.1:9092
+./build/splice-lb --algorithm round-robin 9090 127.0.0.1:9091 127.0.0.1:9092
+./build/splice-lb --algorithm=least-connections 9090 127.0.0.1:9091 127.0.0.1:9092
+```
+
+Manual test in three terminals:
+
+```bash
+# Terminal 1: start three tagged backend servers
+make backend-rr
+# Terminal 2: start the load balancer
+./build/splice-lb --algorithm=least-connections 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+# Terminal 3: issue a TCP request
+./build/backend-client 127.0.0.1 9090 'hello phase 18'
+```
+
+A short request should be returned with a `backend-N|` prefix, but short sequential requests will often look identical under both algorithms. **Use the focused test to observe how active-load imbalance changes selection.**
+
+## Meaning of the comparison
+
+After six held-open sessions both algorithms have active counts `[2,2,2]`. Closing the two sessions on backend 2 yields `[2,2,0]`. Round Robin cycles independently of active load and selects backend IDs `[0,1,2]`, producing `[3,3,1]`. Least Connections selects `[2,2,0]`, producing `[3,2,2]` with the rotating tie-breaker. The active count spread (`max-min`) is 2 versus 1 in this reproducible scenario. This is a **connection-count** metric, not a latency, request-rate or throughput benchmark.
+
+## Debug commands
+
+```bash
+ss -ltn '( sport = :9090 or sport = :9091 or sport = :9092 or sport = :9093 )'
+strace -f -e trace=connect,getsockopt,epoll_ctl,epoll_wait,splice \
+  ./build/splice-lb --algorithm=least-connections 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+`ss` shows kernel sockets, not per-backend scheduler state. Use the proxy's `Selected backend[...]` logs and automated tests for selection. `strace` can introduce significant overhead; never benchmark throughput under tracing.
+
+**Changed files:** `src/main.c`, `tests/test_algorithm_comparison.py`, `Makefile`, `README.md`, `progress.md`. The companion learning PDF is personal material: **do not add it to Git**.
+
+---
+
 # Splice Load Balancer - Phase 17: Least Connections
 
 Fedora Linux / C11 / Linux `epoll` and `splice()`. **This changed-files ZIP applies on top of Phase 16.**
