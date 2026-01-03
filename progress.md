@@ -175,3 +175,16 @@
   - [x] Export optional comparison CSV outside the repo
   - [x] Run strict GCC build, focused algorithm tests, and previous regressions
   - [x] Keep the personal Phase 18 learning PDF outside Git
+
+- [x] Phase 19 - Failed backend handling
+  - [x] Quarantine backend for three seconds after immediate connect error or nonzero SO_ERROR
+  - [x] Use CLOCK_MONOTONIC instead of wall-clock time for retry deadlines
+  - [x] Skip unavailable targets for Round Robin and Least Connections
+  - [x] Restrict recovering backend to one pending TCP probe at a time
+  - [x] Re-enable recovered backend after successful connect
+  - [x] Reject client safely when all backends are cooling down
+  - [x] Keep in-flight failure connection-local; no unsafe TCP request replay
+  - [x] Preserve active-connection counter correctness and existing splice data path
+  - [x] Test failed backend exclusion, 10 healthy binary forwards for each algorithm
+  - [x] Test all-down rejection and backend restart after cooldown
+  - [x] Re-run Phase 2-18 regression suite and keep personal PDF outside repo

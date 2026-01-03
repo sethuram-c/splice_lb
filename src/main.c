@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -21,12 +22,18 @@
 #define PRECONNECT_BUFFER_SIZE 8192U
 #define EVENT_BATCH 64
 #define MAX_BACKENDS 32U
+/* A refused connect removes the backend from new selections for three seconds.
+ * Next request after expiry is a single natural traffic probe, not a timer. */
+#define BACKEND_RETRY_DELAY_MS 3000ULL
 
 struct backend_target {
     struct sockaddr_in address;
     char label[INET_ADDRSTRLEN + 8];
     uint64_t selections;
     size_t active_connections; /* CONNECTING and READY sessions, until teardown */
+    uint64_t retry_after_ms; /* CLOCK_MONOTONIC; zero means selectable */
+    uint64_t connect_failures;
+    bool probe_in_flight; /* at most one in-flight re-probe per failed target */
 };
 
 struct connection;
@@ -132,29 +139,81 @@ static bool parse_backend_spec(const char *text, struct backend_target *target) 
                    ip, (unsigned)port);
     target->selections = 0;
     target->active_connections = 0;
+    target->retry_after_ms = 0;
+    target->connect_failures = 0;
+    target->probe_in_flight = false;
     return true;
 }
 
-/* Selection happens once per client, not per packet. In Least Connections,
- * CONNECTING sockets count too, so a slow handshake does not attract all
- * incoming clients. A rotating tie-break avoids always favoring backend[0].
- * No health checks/retry policy yet: failed attempts consume a selection. */
-static size_t select_backend(struct server *server) {
-    size_t chosen = server->next_backend;
-    if (server->algorithm == BALANCE_LEAST_CONNECTIONS) {
-        size_t minimum = server->backends[chosen].active_connections;
-        for (size_t step = 1; step < server->backend_count; ++step) {
-            size_t candidate = (server->next_backend + step) % server->backend_count;
-            size_t active = server->backends[candidate].active_connections;
-            if (active < minimum) {
-                minimum = active;
-                chosen = candidate;
-            }
+static void report_error(const char *call);
+
+/* All health deadlines use monotonic time, never wall-clock timestamps.
+ * If the clock itself is unavailable, refuse new selections rather than
+ * bypass the cooldown and hammer a failed backend. */
+static bool monotonic_ms(uint64_t *now) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) return false;
+    *now = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    return true;
+}
+
+/* A failed TCP handshake is connection-local, but it also temporarily
+ * quarantines the target for NEW accepts. Established sessions are untouched.
+ * We never replay an in-flight byte stream onto another backend: blindly
+ * retrying can duplicate non-idempotent requests or reorder stream data. */
+static void mark_backend_connect_failed(struct server *server, size_t index,
+                                        int error) {
+    struct backend_target *target = &server->backends[index];
+    uint64_t now;
+    ++target->connect_failures;
+    target->probe_in_flight = false;
+    if (monotonic_ms(&now))
+        target->retry_after_ms = now + BACKEND_RETRY_DELAY_MS;
+    else
+        target->retry_after_ms = UINT64_MAX;
+    fprintf(stderr, "Backend[%zu]=%s connect failure: %s; "
+            "cooldown-ms=%llu; failures=%" PRIu64 "\n",
+            index, target->label, strerror(error),
+            (unsigned long long)BACKEND_RETRY_DELAY_MS,
+            target->connect_failures);
+}
+
+/* Skip cooling-down backends. Choose a healthy target per accepted client;
+ * among healthy targets keep Round Robin or least-active selection semantics.
+ * The rotating cursor advances only on a successful selection. */
+static bool select_backend(struct server *server, size_t *selected) {
+    uint64_t now;
+    if (!monotonic_ms(&now)) {
+        report_error("clock_gettime(CLOCK_MONOTONIC)");
+        return false;
+    }
+    bool found = false;
+    size_t chosen = 0;
+    size_t minimum = SIZE_MAX;
+    for (size_t step = 0; step < server->backend_count; ++step) {
+        size_t candidate = (server->next_backend + step) % server->backend_count;
+        struct backend_target *target = &server->backends[candidate];
+        if (target->retry_after_ms > now || target->probe_in_flight) continue;
+        if (server->algorithm == BALANCE_ROUND_ROBIN) {
+            chosen = candidate;
+            found = true;
+            break;
+        }
+        if (!found || target->active_connections < minimum) {
+            chosen = candidate;
+            minimum = target->active_connections;
+            found = true;
         }
     }
+    if (!found) return false;
+    /* An expired quarantine gets one natural connect probe, not a flood.
+     * If it fails again, the new failure immediately extends the deadline. */
     server->next_backend = (chosen + 1U) % server->backend_count;
-    ++server->backends[chosen].selections;
-    return chosen;
+    struct backend_target *target = &server->backends[chosen];
+    ++target->selections;
+    if (target->retry_after_ms != 0) target->probe_in_flight = true;
+    *selected = chosen;
+    return true;
 }
 
 static void report_error(const char *call) {
@@ -286,6 +345,11 @@ static bool fully_forwarded(const struct connection *connection) {
 }
 
 static void remove_connection(struct server *server, struct connection *connection) {
+    /* If the client vanishes before the health re-probe completes, allow a
+     * later connection to try again; this attempt proves neither health nor
+     * a backend fault. The original cooldown deadline remains unchanged. */
+    if (connection->backend_state == BACKEND_CONNECTING)
+        server->backends[connection->backend_index].probe_in_flight = false;
     struct connection **cursor = &server->connections;
     while (*cursor != NULL && *cursor != connection) cursor = &(*cursor)->next;
     if (*cursor == connection) *cursor = connection->next;
@@ -521,6 +585,7 @@ static bool update_interests(struct server *server, struct connection *connectio
 }
 
 static bool attach_connection(struct server *server, int client) {
+    bool backend_selected = false;
     struct connection *connection = calloc(1, sizeof(*connection));
     if (!connection) {
         report_error("calloc(connection)");
@@ -536,7 +601,11 @@ static bool attach_connection(struct server *server, int client) {
     connection->client.is_client = true;
     connection->client.owner = connection;
     connection->backend.owner = connection;
-    connection->backend_index = select_backend(server);
+    if (!select_backend(server, &connection->backend_index)) {
+        fputs("No healthy backends; rejecting client while targets cool down\n", stderr);
+        goto fail;
+    }
+    backend_selected = true;
     const struct backend_target *target = &server->backends[connection->backend_index];
     printf("Selected backend[%zu]=%s; selections=%" PRIu64
            "; backend-active-before=%zu; algorithm=%s\n",
@@ -558,10 +627,18 @@ static bool attach_connection(struct server *server, int client) {
                                  sizeof(target->address));
     if (connect_result == 0) {
         connection->backend_state = BACKEND_READY;
+        if (target->probe_in_flight) {
+            printf("Backend[%zu]=%s recovered after successful TCP handshake\n",
+                   connection->backend_index, target->label);
+            server->backends[connection->backend_index].retry_after_ms = 0;
+            server->backends[connection->backend_index].probe_in_flight = false;
+        }
     } else if (errno == EINPROGRESS) {
         connection->backend_state = BACKEND_CONNECTING;
     } else {
+        int connect_error = errno;
         report_error("connect(backend)");
+        mark_backend_connect_failed(server, connection->backend_index, connect_error);
         goto fail;
     }
     connection->to_backend.source = client;
@@ -592,6 +669,8 @@ static bool attach_connection(struct server *server, int client) {
     fflush(stdout);
     return true;
 fail:
+    if (backend_selected)
+        server->backends[connection->backend_index].probe_in_flight = false;
     release_endpoint(server, &connection->client);
     release_endpoint(server, &connection->backend);
     close_connection_pipes(connection);
@@ -629,9 +708,17 @@ static bool complete_backend_connect(struct server *server,
     if (socket_error != 0) {
         errno = socket_error;
         report_error("connect(backend)");
+        mark_backend_connect_failed(server, connection->backend_index, socket_error);
         return false;
     }
     connection->backend_state = BACKEND_READY;
+    struct backend_target *target = &server->backends[connection->backend_index];
+    if (target->probe_in_flight) {
+        printf("Backend[%zu]=%s recovered after successful TCP handshake\n",
+               connection->backend_index, target->label);
+        target->retry_after_ms = 0;
+        target->probe_in_flight = false;
+    }
     printf("Connected to backend; preconnect-buffered=%zu bytes; active=%zu\n",
            connection->preconnect_buffered, server->active);
     fflush(stdout);

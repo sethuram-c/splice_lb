@@ -860,3 +860,69 @@ consume kernel resources: thousands of sessions must be verified later
 against memory and `ulimit -n` rather than assumed to scale. Pipe-to-socket
 forwarding, `EAGAIN` recovery, and pipe occupancy tracking follow in Phases
 11-14. The learning guide PDF is personal study material, not a repo file.
+
+## Phase 19 - failed backend handling (3-second cooldown)
+
+The load balancer now **temporarily excludes a backend after its TCP
+connection attempt fails**, either immediately in `connect()` or after an
+`EINPROGRESS` completion reports a nonzero `SO_ERROR`. It does **not** replay
+or retry the failed client's TCP request: non-idempotent streams cannot be
+safely replayed without application-level semantics. A failed client closes
+cleanly; later clients are directed only to selectable backends.
+
+Each backend has a monotonic-clock retry deadline, a connect-failure counter,
+and an in-flight recovery probe flag. Round Robin skips unavailable targets;
+Least Connections scans active counts only among selectable targets. Once
+three seconds have elapsed, **one new connection** can probe the target. If
+its TCP handshake succeeds, the backend rejoins the pool. If that probe
+fails, another three-second cooldown begins. Existing healthy connections
+keep forwarding normally. No timer thread or busy-poll is required.
+
+If all targets are cooling down, new clients are closed and the listening
+process remains alive. Active-connection counters are unchanged for rejected
+requests and still decrement exactly once after a failed CONNECTING session.
+Backends with a successful TCP handshake but later application-level failure
+are NOT detected by this phase; connection/idle timeouts and deeper failure
+handling are scheduled for later phases.
+
+### Fedora verification
+
+```bash
+make clean
+make
+make test
+python3 tests/test_backend_failures.py
+```
+
+Expected focused result:
+
+```text
+PASS: round-robin quarantines refused target; 10 byte-exact healthy forwards
+PASS: least-connections quarantines refused target; 10 byte-exact healthy forwards
+PASS: all-down pool rejects new clients without crashing or leaking slots
+PASS: recovered backend is re-probed after cooldown and reused
+PASS: Phase 19 failed backend handling test suite
+```
+
+Optional manual test (three terminals):
+
+```bash
+# Terminal 1: backend-0 on 9091 is deliberately absent; start two others
+python3 tests/rr_backends.py 9092 9093
+# Terminal 2
+./build/splice-lb --algorithm=round-robin 9090 \
+  127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+# Terminal 3: first request can fail while discovering backend 0;
+# later new requests skip it until its health deadline expires
+./build/backend-client 127.0.0.1 9090 'probe-one'
+./build/backend-client 127.0.0.1 9090 'probe-two'
+```
+
+`ss -ltn` shows listening TCP ports; `strace -e trace=connect,getsockopt,epoll_wait`
+shows the nonblocking connect/`SO_ERROR` sequence. A working echo backend
+that initially failed can be added later on the *same* port; it becomes
+eligible after the short cooldown. Run the automated tests to prove this
+recovery deterministically with ephemeral loopback ports.
+
+Personal Phase 19 learning notes are delivered as a separate PDF outside the
+repository. The source ZIP contains only changed/new repo files.
