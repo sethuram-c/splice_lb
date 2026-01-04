@@ -64,6 +64,7 @@ test: all
 	python3 tests/test_least_connections.py
 	python3 tests/test_algorithm_comparison.py
 	python3 tests/test_backend_failures.py
+	python3 tests/test_backpressure_duplex.py
 
 clean:
 	rm -rf build

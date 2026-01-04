@@ -176,15 +176,19 @@
   - [x] Run strict GCC build, focused algorithm tests, and previous regressions
   - [x] Keep the personal Phase 18 learning PDF outside Git
 
-- [x] Phase 19 - Failed backend handling
-  - [x] Quarantine backend for three seconds after immediate connect error or nonzero SO_ERROR
-  - [x] Use CLOCK_MONOTONIC instead of wall-clock time for retry deadlines
-  - [x] Skip unavailable targets for Round Robin and Least Connections
-  - [x] Restrict recovering backend to one pending TCP probe at a time
-  - [x] Re-enable recovered backend after successful connect
-  - [x] Reject client safely when all backends are cooling down
-  - [x] Keep in-flight failure connection-local; no unsafe TCP request replay
-  - [x] Preserve active-connection counter correctness and existing splice data path
-  - [x] Test failed backend exclusion, 10 healthy binary forwards for each algorithm
-  - [x] Test all-down rejection and backend restart after cooldown
-  - [x] Re-run Phase 2-18 regression suite and keep personal PDF outside repo
+
+- [x] Phase 19 - Failed backend handling (previous phase)
+  - [x] Quarantine refused backend TCP handshakes with a monotonic cooldown
+  - [x] Skip down targets in Round Robin and Least Connections selection
+  - [x] Keep healthy connections active; allow safe one-at-a-time recovery probing
+
+- [x] Phase 20 - Backpressure in both directions
+  - [x] Track independent client-to-backend and backend-to-client paused states
+  - [x] Count backpressure pause/resume transitions separately per direction
+  - [x] Measure peak queue occupancy including transient socket-to-pipe splices
+  - [x] Enforce a 64 KiB bounded application/pipe queue per direction
+  - [x] Preserve EPOLLIN pause / EPOLLOUT resume without busy loops
+  - [x] Confirm both destination sockets need EPOLLOUT at the same time
+  - [x] Transfer 6 MiB in each direction with exact binary comparison
+  - [x] Run Phase 2-17 regressions and Phase 18-20 focused tests
+  - [x] Keep personal learning PDF outside Git and source ZIP

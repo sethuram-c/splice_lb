@@ -62,6 +62,13 @@ struct direction {
     /* Phase 14: destination-side output readiness is independent of pipe fill.
      * Pending pipe bytes survive EAGAIN until destination EPOLLOUT fires. */
     bool drain_blocked;
+    /* Phase 20: one bounded queue per direction (socket reads are disabled
+     * whenever either pending queue is nonempty). These counters make the
+     * two independent pressure states observable in an integration test. */
+    bool source_paused;
+    uint64_t backpressure_pauses;
+    uint64_t backpressure_resumes;
+    size_t peak_queued_bytes;
     uint64_t partial_pipe_drains;
     uint64_t pipe_drain_eagain;
     unsigned char buffer[COPY_BUFFER_SIZE];
@@ -323,8 +330,39 @@ static void close_connection_pipes(struct connection *connection) {
 /* Phase 15: a byte-counting invariant is not a content hash. It catches
  * lost/double-counted bytes inside our two-hop forwarding state machine;
  * byte-for-byte payload tests provide independent content verification. */
+static size_t direction_queued_bytes(const struct direction *direction) {
+    return direction->pending + direction->pipe_pending;
+}
+
+/* Only 8 KiB can be staged during connect, and staging fully drains before
+ * a socket->pipe splice begins. The direction never owns more than 64 KiB
+ * of outstanding application/kernel-pipe bytes at a time. */
+static void record_queued_peak(struct direction *direction) {
+    const size_t queued = direction_queued_bytes(direction);
+    if (queued > direction->peak_queued_bytes)
+        direction->peak_queued_bytes = queued;
+}
+
+static bool account_backpressure(struct direction *direction) {
+    const size_t queued = direction_queued_bytes(direction);
+    if (queued > COPY_BUFFER_SIZE) {
+        fprintf(stderr, "backpressure queue exceeded limit: %zu > %u\n",
+                queued, COPY_BUFFER_SIZE);
+        return false;
+    }
+    record_queued_peak(direction);
+    const bool pause = queued != 0 || direction->drain_blocked;
+    if (pause != direction->source_paused) {
+        if (pause) ++direction->backpressure_pauses;
+        else ++direction->backpressure_resumes;
+        direction->source_paused = pause;
+    }
+    return true;
+}
+
 static bool direction_accounting_valid(const struct direction *direction) {
-    return direction->spliced_from_pipe <= direction->spliced_to_pipe &&
+    return direction_queued_bytes(direction) <= COPY_BUFFER_SIZE &&
+           direction->spliced_from_pipe <= direction->spliced_to_pipe &&
            direction->spliced_to_pipe - direction->spliced_from_pipe ==
                (uint64_t)direction->pipe_pending &&
            direction->forwarded ==
@@ -386,6 +424,16 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_client.partial_pipe_drains,
            connection->to_backend.pipe_drain_eagain,
            connection->to_client.pipe_drain_eagain);
+    printf("backpressure-pauses=%" PRIu64 "/%" PRIu64
+           "; backpressure-resumes=%" PRIu64 "/%" PRIu64
+           "; backpressure-peak=%zu/%zu bytes; queue-cap=%u bytes\n",
+           connection->to_backend.backpressure_pauses,
+           connection->to_client.backpressure_pauses,
+           connection->to_backend.backpressure_resumes,
+           connection->to_client.backpressure_resumes,
+           connection->to_backend.peak_queued_bytes,
+           connection->to_client.peak_queued_bytes,
+           COPY_BUFFER_SIZE);
     printf("transfer-integrity=%s; staged=%" PRIu64 "; "
            "pipe-pending=%zu/%zu; forwarded=%" PRIu64 "/%" PRIu64 "\n",
            fully_forwarded(connection) ? "verified" : "incomplete",
@@ -505,6 +553,7 @@ static bool read_spliced_direction(struct direction *direction) {
             if ((size_t)got < requested) ++direction->partial_pipe_writes;
             direction->pipe_pending += (size_t)got;
             direction->spliced_to_pipe += (uint64_t)got;
+            record_queued_peak(direction);
             continue;
         }
         if (got == 0) {
@@ -535,6 +584,7 @@ static bool stage_client_data(struct connection *connection) {
             direction->offset = 0;
             direction->pending = (size_t)got;
             connection->preconnect_buffered += (size_t)got;
+            record_queued_peak(direction);
             return true;
         }
         if (got == 0) {
@@ -567,13 +617,14 @@ static bool update_interests(struct server *server, struct connection *connectio
     const struct direction *down = &connection->to_client;
     uint32_t client_mask = 0;
     uint32_t backend_mask = 0;
+    if (!account_backpressure(&connection->to_backend) ||
+        !account_backpressure(&connection->to_client)) return false;
 
-    /* The output of 'down' is the client, the output of 'up' is backend. */
-    if (!up->source_eof && up->pending == 0 && up->pipe_pending == 0 &&
-        !up->drain_blocked)
+    /* Source EPOLLIN stays disabled until all of that direction's queued
+     * bytes have been drained. Destination EPOLLOUT drives the retry. */
+    if (!up->source_eof && !up->source_paused)
         client_mask |= EPOLLIN;
-    if (!down->source_eof && down->pending == 0 && down->pipe_pending == 0 &&
-        !down->drain_blocked)
+    if (!down->source_eof && !down->source_paused)
         backend_mask |= EPOLLIN;
     if (down->pending > 0 || down->pipe_pending > 0 || down->drain_blocked)
         client_mask |= EPOLLOUT;
