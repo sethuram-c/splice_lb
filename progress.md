@@ -192,3 +192,12 @@
   - [x] Transfer 6 MiB in each direction with exact binary comparison
   - [x] Run Phase 2-17 regressions and Phase 18-20 focused tests
   - [x] Keep personal learning PDF outside Git and source ZIP
+
+- [x] Phase 21 - EOF tracking and client half-close
+  - [x] Track client input OPEN -> EOF_OBSERVED -> FIN_FORWARDED once per TCP session
+  - [x] Treat EPOLLRDHUP as a hint; only a zero-byte read/splice confirms EOF
+  - [x] Drain staged and pipe bytes before backend shutdown(SHUT_WR)
+  - [x] Preserve backend-to-client replies after client half-close
+  - [x] Verify delayed-connect 0 B and 8 KiB uploads plus 4 MiB slow-backend upload
+  - [x] Run Phase 2-21 regression suite with strict C build
+  - [x] Keep the personal learning PDF outside Git and source ZIP

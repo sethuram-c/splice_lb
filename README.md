@@ -1,3 +1,67 @@
+# Phase 21 - EOF Tracking and Client Half-Close
+
+Fedora Linux / C11 / `epoll` / `splice()`.
+Apply the Phase 21 changed-files ZIP **on top of Phase 20**. This ZIP contains only the new/changed repository files. Keep the companion PDF outside Git.
+
+## What changed
+
+- Track the TCP client half-close with distinct `CLIENT_FIN_OPEN`, `CLIENT_FIN_EOF_OBSERVED`, and `CLIENT_FIN_FORWARDED` states. A `recv()`/`splice()` return value of zero establishes a logical EOF. `EPOLLRDHUP` is a hint, not proof that all queued data has been consumed.
+- Monitor `EPOLLRDHUP` only while the input side is eligible for reading. Avoid registering input readiness while the per-direction staged/pipe queue is backpressured.
+- Do not forward the client FIN until all staged bytes and kernel-pipe bytes have drained and the backend TCP connection is `READY`. Forward FIN using `shutdown(backend_fd, SHUT_WR)`, retaining the backend-to-client receive path.
+- Log each client EOF transition exactly once and expose whether FIN forwarding had to wait for a backend connection or outstanding data. Log `client-eof-final=forwarded` on a cleanly finished connection.
+- `tests/test_client_eof.py` covers an immediate zero-byte half-close before the backend handshake is confirmed, an 8 KiB staged upload and FIN during connection setup, and a 4 MiB upload to a delayed reader. Each tests complete response delivery and correct final state.
+- Existing load-balancing choices, the 64 KiB directional queue limit, and `splice()` forwarding semantics are unchanged.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase21_changes.zip
+unzip -o ~/Downloads/phase21_changes.zip -d .
+make clean
+make
+make test
+python3 tests/test_client_eof.py
+```
+
+Expected focused output:
+
+```text
+PASS: client FIN deferred safely (delayed-connect, payload=0, slow-backend=False)
+PASS: client FIN deferred safely (delayed-connect, payload=8192, slow-backend=False)
+PASS: client FIN deferred safely (normal, payload=4194304, slow-backend=True)
+PASS: Phase 21 client EOF and deferred FIN lifecycle test suite
+```
+
+The full Phase 2-21 regression suite also passed. The test uses only Python 3, a C compiler, Linux loopback, and local sockets.
+
+## Manual verification - 3 terminals
+
+```bash
+# Terminal 1
+make backend-multi
+# Terminal 2
+make run
+# Terminal 3
+./build/backend-client 127.0.0.1 9090 'hello phase 21'
+```
+
+The client prints `hello phase 21`. After cleanup the proxy log should contain `client-eof-state=observed`, `client-eof-state=forwarded`, `client-eof-final=forwarded`, and `transfer-integrity=verified`. The small interactive test does not guarantee the deferred path; run `python3 tests/test_client_eof.py` for that.
+
+## Linux inspection and debugging
+
+```bash
+ss -tn '( sport = :9090 or dport = :9090 )'
+strace -f -e trace=splice,recvfrom,shutdown,epoll_ctl,epoll_wait \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+Only run one proxy listening on port 9090 at once. `strace` affects timing and is useful for correctness inspection, not throughput benchmarking. The companion learning PDF explains the half-close TCP state machine, `EPOLLRDHUP`, EOF, `shutdown()`, and every command.
+
+**Files changed in Phase 21:** `src/main.c`, `tests/test_client_eof.py`, `Makefile`, `README.md`, and `progress.md`. Do not add the PDF to the repository.
+
+---
+
 # Splice Load Balancer - Phase 20: Bidirectional Backpressure
 
 Fedora Linux | C11 | Linux `epoll` + `splice()` | Apply this changed-files archive over **Phase 19**.

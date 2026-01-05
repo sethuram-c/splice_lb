@@ -82,10 +82,19 @@ struct direction {
     bool destination_shutdown;
 };
 enum backend_state { BACKEND_CONNECTING, BACKEND_READY };
+/* Phase 21: a client FIN is not permission to discard already-read data.
+ * EOF_OBSERVED means splice()/recv() returned zero, while FIN_FORWARDED
+ * means the backend write side has actually been shut down after draining. */
+enum client_fin_state {
+    CLIENT_FIN_OPEN, CLIENT_FIN_EOF_OBSERVED, CLIENT_FIN_FORWARDED
+};
 
 struct connection {
     enum backend_state backend_state;
     size_t preconnect_buffered; /* client bytes staged before SO_ERROR success */
+    enum client_fin_state client_fin_state;
+    bool client_rdhup_hint; /* EPOLLRDHUP is a hint; not proof input was drained */
+    bool client_fin_was_deferred; /* EOF arrived with a queue or connecting backend */
     size_t backend_index; /* stable for this connection until cleanup */
     struct connection *next;
     struct endpoint client;
@@ -373,6 +382,7 @@ static bool fully_forwarded(const struct connection *connection) {
     const struct direction *up = &connection->to_backend;
     const struct direction *down = &connection->to_client;
     return connection->backend_state == BACKEND_READY &&
+           connection->client_fin_state == CLIENT_FIN_FORWARDED &&
            up->source_eof && down->source_eof &&
            up->destination_shutdown && down->destination_shutdown &&
            up->pending == 0 && down->pending == 0 &&
@@ -434,6 +444,11 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_backend.peak_queued_bytes,
            connection->to_client.peak_queued_bytes,
            COPY_BUFFER_SIZE);
+    printf("client-eof-final=%s; client-fin-deferred=%s; rdhup-hint=%s\n",
+           connection->client_fin_state == CLIENT_FIN_FORWARDED ? "forwarded" :
+           connection->client_fin_state == CLIENT_FIN_EOF_OBSERVED ? "observed" : "open",
+           connection->client_fin_was_deferred ? "yes" : "no",
+           connection->client_rdhup_hint ? "yes" : "no");
     printf("transfer-integrity=%s; staged=%" PRIu64 "; "
            "pipe-pending=%zu/%zu; forwarded=%" PRIu64 "/%" PRIu64 "\n",
            fully_forwarded(connection) ? "verified" : "incomplete",
@@ -609,7 +624,8 @@ static bool stage_client_data(struct connection *connection) {
 static bool update_interests(struct server *server, struct connection *connection) {
     if (connection->backend_state == BACKEND_CONNECTING) {
         uint32_t early_read = (!connection->to_backend.source_eof &&
-                               connection->to_backend.pending == 0) ? EPOLLIN : 0;
+                               connection->to_backend.pending == 0) ?
+                              (EPOLLIN | EPOLLRDHUP) : 0;
         return change_interest(server, &connection->client, early_read) &&
                change_interest(server, &connection->backend, EPOLLOUT);
     }
@@ -623,9 +639,9 @@ static bool update_interests(struct server *server, struct connection *connectio
     /* Source EPOLLIN stays disabled until all of that direction's queued
      * bytes have been drained. Destination EPOLLOUT drives the retry. */
     if (!up->source_eof && !up->source_paused)
-        client_mask |= EPOLLIN;
+        client_mask |= EPOLLIN | EPOLLRDHUP;
     if (!down->source_eof && !down->source_paused)
-        backend_mask |= EPOLLIN;
+        backend_mask |= EPOLLIN | EPOLLRDHUP;
     if (down->pending > 0 || down->pipe_pending > 0 || down->drain_blocked)
         client_mask |= EPOLLOUT;
     if (up->pending > 0 || up->pipe_pending > 0 || up->drain_blocked)
@@ -705,8 +721,9 @@ static bool attach_connection(struct server *server, int client) {
     connection->to_backend.pipe_write_fd = connection->pipe_to_backend[1];
     connection->to_client.pipe_read_fd = connection->pipe_to_client[0];
     connection->to_client.pipe_write_fd = connection->pipe_to_client[1];
-    uint32_t client_events = EPOLLIN; /* stage early bytes while CONNECTING */
-    uint32_t backend_events = connection->backend_state == BACKEND_READY ? EPOLLIN : EPOLLOUT;
+    uint32_t client_events = EPOLLIN | EPOLLRDHUP; /* early bytes / FIN hint */
+    uint32_t backend_events = connection->backend_state == BACKEND_READY ?
+                              (EPOLLIN | EPOLLRDHUP) : EPOLLOUT;
     if (!register_endpoint(server, &connection->client, client_events) ||
         !register_endpoint(server, &connection->backend, backend_events)) goto fail;
     connection->next = server->connections;
@@ -779,6 +796,33 @@ static bool complete_backend_connect(struct server *server,
            update_interests(server, connection);
 }
 
+/* Observe FIN transitions exactly once. EPOLLRDHUP can arrive while data is
+ * unread, so only recv()/splice()==0 marks logical source EOF. Likewise,
+ * shutdown(SHUT_WR) is only forwarded after BOTH staged bytes and pipe bytes
+ * are fully drained. The two states intentionally remain distinct. */
+static void track_client_fin(struct connection *connection) {
+    const struct direction *up = &connection->to_backend;
+    if (up->source_eof && connection->client_fin_state == CLIENT_FIN_OPEN) {
+        connection->client_fin_state = CLIENT_FIN_EOF_OBSERVED;
+        bool deferred = connection->backend_state == BACKEND_CONNECTING ||
+                        direction_queued_bytes(up) != 0;
+        connection->client_fin_was_deferred = deferred;
+        printf("client-eof-state=observed; deferred=%s; pending=%zu; "
+               "pipe-pending=%zu; backend=%s\n",
+               deferred ? "yes" : "no", up->pending, up->pipe_pending,
+               connection->backend_state == BACKEND_CONNECTING ? "connecting" : "ready");
+        fflush(stdout);
+    }
+    if (up->destination_shutdown &&
+        connection->client_fin_state == CLIENT_FIN_EOF_OBSERVED) {
+        connection->client_fin_state = CLIENT_FIN_FORWARDED;
+        printf("client-eof-state=forwarded; bytes=%" PRIu64
+               "; pending=%zu; pipe-pending=%zu\n",
+               up->forwarded, up->pending, up->pipe_pending);
+        fflush(stdout);
+    }
+}
+
 static void dispatch_client_event(struct server *server, uint64_t token,
                                   uint32_t flags) {
     int fd = (int)(uint32_t)token;
@@ -786,11 +830,14 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     struct endpoint *endpoint = server->by_fd[fd];
     if (endpoint == NULL || endpoint->token != token) return; /* stale event */
     struct connection *connection = endpoint->owner;
+    if (endpoint->is_client && (flags & EPOLLRDHUP))
+        connection->client_rdhup_hint = true;
     if (connection->backend_state == BACKEND_CONNECTING) {
         if (endpoint->is_client) {
             bool ok = true;
             if (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
                 ok = stage_client_data(connection);
+            track_client_fin(connection);
             if (!ok || !update_interests(server, connection))
                 remove_connection(server, connection);
             return;
@@ -816,6 +863,7 @@ static void dispatch_client_event(struct server *server, uint64_t token,
         fputs("splice accounting invariant failed\n", stderr);
         ok = false;
     }
+    track_client_fin(connection);
     if (ok && incoming->destination_shutdown && outgoing->destination_shutdown) {
         remove_connection(server, connection);
         return;
