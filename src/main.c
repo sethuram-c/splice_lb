@@ -88,6 +88,12 @@ enum backend_state { BACKEND_CONNECTING, BACKEND_READY };
 enum client_fin_state {
     CLIENT_FIN_OPEN, CLIENT_FIN_EOF_OBSERVED, CLIENT_FIN_FORWARDED
 };
+/* Phase 22: the backend's send half closes independently of its receive half.
+ * Neither receiving FIN nor forwarding it permits discarding an active client
+ * upload. Completion requires BOTH streams to be drained and half-closed. */
+enum backend_fin_state {
+    BACKEND_FIN_OPEN, BACKEND_FIN_EOF_OBSERVED, BACKEND_FIN_FORWARDED
+};
 
 struct connection {
     enum backend_state backend_state;
@@ -95,6 +101,9 @@ struct connection {
     enum client_fin_state client_fin_state;
     bool client_rdhup_hint; /* EPOLLRDHUP is a hint; not proof input was drained */
     bool client_fin_was_deferred; /* EOF arrived with a queue or connecting backend */
+    enum backend_fin_state backend_fin_state;
+    bool backend_rdhup_hint;
+    bool backend_fin_was_deferred; /* pending backend response on EOF */
     size_t backend_index; /* stable for this connection until cleanup */
     struct connection *next;
     struct endpoint client;
@@ -449,6 +458,11 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->client_fin_state == CLIENT_FIN_EOF_OBSERVED ? "observed" : "open",
            connection->client_fin_was_deferred ? "yes" : "no",
            connection->client_rdhup_hint ? "yes" : "no");
+    printf("backend-eof-final=%s; backend-fin-deferred=%s; backend-rdhup-hint=%s\n",
+           connection->backend_fin_state == BACKEND_FIN_FORWARDED ? "forwarded" :
+           connection->backend_fin_state == BACKEND_FIN_EOF_OBSERVED ? "observed" : "open",
+           connection->backend_fin_was_deferred ? "yes" : "no",
+           connection->backend_rdhup_hint ? "yes" : "no");
     printf("transfer-integrity=%s; staged=%" PRIu64 "; "
            "pipe-pending=%zu/%zu; forwarded=%" PRIu64 "/%" PRIu64 "\n",
            fully_forwarded(connection) ? "verified" : "incomplete",
@@ -823,6 +837,41 @@ static void track_client_fin(struct connection *connection) {
     }
 }
 
+/* A backend FIN is only an EOF on the backend->client byte stream.
+ * The opposite client->backend upload may still be in progress, even after
+ * the backend has finished its response. EPOLLRDHUP is only a hint; the
+ * splice() source returning zero is the authoritative EOF observation. */
+static void track_backend_fin(struct connection *connection) {
+    const struct direction *down = &connection->to_client;
+    if (down->source_eof && connection->backend_fin_state == BACKEND_FIN_OPEN) {
+        connection->backend_fin_state = BACKEND_FIN_EOF_OBSERVED;
+        connection->backend_fin_was_deferred = direction_queued_bytes(down) != 0;
+        printf("backend-eof-state=observed; deferred=%s; pending=%zu; "
+               "pipe-pending=%zu; client-upload-done=%s\n",
+               connection->backend_fin_was_deferred ? "yes" : "no",
+               down->pending, down->pipe_pending,
+               connection->to_backend.destination_shutdown ? "yes" : "no");
+        fflush(stdout);
+    }
+    if (down->destination_shutdown &&
+        connection->backend_fin_state == BACKEND_FIN_EOF_OBSERVED) {
+        connection->backend_fin_state = BACKEND_FIN_FORWARDED;
+        printf("backend-eof-state=forwarded; bytes=%" PRIu64
+               "; pending=%zu; pipe-pending=%zu\n",
+               down->forwarded, down->pending, down->pipe_pending);
+        fflush(stdout);
+    }
+}
+
+/* The two TCP halves are independent. Never release a session just because
+ * the backend has shut down its sending half; that would discard a late
+ * client upload. The integrity invariant is checked before clean teardown. */
+static bool ready_for_clean_completion(const struct connection *connection) {
+    return connection->client_fin_state == CLIENT_FIN_FORWARDED &&
+           connection->backend_fin_state == BACKEND_FIN_FORWARDED &&
+           fully_forwarded(connection);
+}
+
 static void dispatch_client_event(struct server *server, uint64_t token,
                                   uint32_t flags) {
     int fd = (int)(uint32_t)token;
@@ -830,8 +879,10 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     struct endpoint *endpoint = server->by_fd[fd];
     if (endpoint == NULL || endpoint->token != token) return; /* stale event */
     struct connection *connection = endpoint->owner;
-    if (endpoint->is_client && (flags & EPOLLRDHUP))
-        connection->client_rdhup_hint = true;
+    if (flags & EPOLLRDHUP) {
+        if (endpoint->is_client) connection->client_rdhup_hint = true;
+        else connection->backend_rdhup_hint = true;
+    }
     if (connection->backend_state == BACKEND_CONNECTING) {
         if (endpoint->is_client) {
             bool ok = true;
@@ -864,7 +915,11 @@ static void dispatch_client_event(struct server *server, uint64_t token,
         ok = false;
     }
     track_client_fin(connection);
-    if (ok && incoming->destination_shutdown && outgoing->destination_shutdown) {
+    track_backend_fin(connection);
+    if (ok && ready_for_clean_completion(connection)) {
+        puts("connection-completion=graceful; both-fins-forwarded=yes; "
+             "queued-to-backend=0; queued-to-client=0");
+        fflush(stdout);
         remove_connection(server, connection);
         return;
     }

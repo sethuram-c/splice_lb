@@ -1,3 +1,66 @@
+# Phase 22 - Backend Half-Close and Connection Completion
+
+Fedora Linux | C11 | Linux `epoll` and `splice()` | apply on top of **Phase 21**.
+
+## What changed
+
+- Add backend-side lifecycle states `BACKEND_FIN_OPEN`, `BACKEND_FIN_EOF_OBSERVED`, and `BACKEND_FIN_FORWARDED`. These are independent of `CLIENT_FIN_*` states introduced in Phase 21.
+- Observe `EPOLLRDHUP` for either endpoint as a *hint*, but only regard `splice(socket -> pipe) == 0` as an actual source EOF.
+- Defer forwarding backend FIN to the client (`shutdown(client_fd, SHUT_WR)`) until every queued backend response byte has drained from both the in-memory staging queue and the kernel pipe.
+- Introduce `ready_for_clean_completion()`: clean teardown requires **both FINs forwarded**, **both source EOFs**, **both queues empty**, and passing accounting invariants. Backend FIN alone never discards an unfinished client upload.
+- Print `backend-eof-state=observed`, `backend-eof-state=forwarded`, `backend-eof-final`, and `connection-completion=graceful` diagnostics; preserve all earlier diagnostic lines.
+- Add `tests/test_backend_eof.py` for an early backend FIN followed by a 2 MiB client upload (with empty and nonempty backend replies) and for 4 MiB response delivery to a delayed client reader.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase22_changes.zip
+unzip -o ~/Downloads/phase22_changes.zip -d .
+make clean
+make
+make test
+python3 tests/test_backend_eof.py
+```
+
+Expected focused test output:
+
+```text
+PASS: backend FIN first, reply=530 bytes, then 2 MiB upload intact
+PASS: backend FIN first, reply=0 bytes, then 2 MiB upload intact
+PASS: delayed client receives full 4 MiB response after upload FIN
+PASS: Phase 22 backend half-close and graceful connection completion test suite
+```
+
+The existing Phase 2-17 suites and focused Phase 18-22 tests were verified in the execution environment; the uninterrupted `make test` run was stopped by its execution time limit, so also run it directly on Fedora.
+
+## Manual test - three terminals
+
+```bash
+# Terminal 1
+make backend-multi
+# Terminal 2
+make run
+# Terminal 3
+./build/backend-client 127.0.0.1 9090 'hello phase 22'
+```
+
+Expected client reply: `hello phase 22`. The proxy completion log should include `client-eof-final=forwarded`, `backend-eof-final=forwarded`, `connection-completion=graceful`, and `transfer-integrity=verified`. For backend-FIN-first ordering use `python3 tests/test_backend_eof.py` instead of the ordinary echo backend.
+
+## Observe Linux behavior
+
+```bash
+ss -tn '( sport = :9090 or dport = :9090 )'
+strace -f -e trace=splice,shutdown,epoll_ctl,epoll_wait \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+`ss` shows TCP connection states (including half-close transitions). `strace` observes actual system calls but changes timing; it is not a performance benchmark. Keep the accompanying PDF outside the Git repository.
+
+**Phase 22 changed/new files:** `src/main.c`, `tests/test_backend_eof.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 21 - EOF Tracking and Client Half-Close
 
 Fedora Linux / C11 / `epoll` / `splice()`.

@@ -1,3 +1,12 @@
+## Phase 22 - Backend half-close and connection completion (2026-12-06)
+
+- Distinguish observed backend EOF from FIN forwarded to the client. Treat `EPOLLRDHUP` only as a readiness hint; `splice() == 0` confirms source EOF.
+- Preserve an active client upload after the backend closes its write half; never close the entire session on a single FIN.
+- Enforce graceful teardown only after both FINs propagate, pending data drains in both directions, and forwarding/accounting invariants are satisfied.
+- Add three deterministic backend EOF tests: 530-byte response then 2 MiB late upload; empty response then 2 MiB late upload; 4 MiB backend response to a delayed reader after a 1 MiB client upload.
+- Verified clean C11 build, Phases 2-17 regression tests, and Phase 18-22 focused suites; combined full run stopped at time limit during Phase 18.
+- Commit (scheduled): `feat: complete backend half-close and TCP session teardown`.
+
 # Project progress
 
 - [x] Phase 1 - Project setup and TCP socket creation

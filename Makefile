@@ -66,6 +66,7 @@ test: all
 	python3 tests/test_backend_failures.py
 	python3 tests/test_backpressure_duplex.py
 	python3 tests/test_client_eof.py
+	python3 tests/test_backend_eof.py
 
 clean:
 	rm -rf build
