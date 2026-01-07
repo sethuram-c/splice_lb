@@ -114,6 +114,29 @@ struct connection {
     struct direction to_backend;
     struct direction to_client;
 };
+/* Phase 23: all exits use the same teardown; the reason distinguishes a
+ * graceful two-FIN completion from an abrupt peer failure. */
+enum close_reason {
+    CLOSE_GRACEFUL,
+    CLOSE_CLIENT_ABORT,
+    CLOSE_BACKEND_ABORT,
+    CLOSE_BACKEND_CONNECT_FAILURE,
+    CLOSE_INTERNAL_ERROR,
+    CLOSE_SERVER_SHUTDOWN
+};
+
+static const char *close_reason_name(enum close_reason reason) {
+    switch (reason) {
+    case CLOSE_GRACEFUL: return "graceful";
+    case CLOSE_CLIENT_ABORT: return "client-abort";
+    case CLOSE_BACKEND_ABORT: return "backend-abort";
+    case CLOSE_BACKEND_CONNECT_FAILURE: return "backend-connect-failure";
+    case CLOSE_INTERNAL_ERROR: return "internal-error";
+    case CLOSE_SERVER_SHUTDOWN: return "server-shutdown";
+    }
+    return "unknown";
+}
+
 enum balance_algorithm { BALANCE_ROUND_ROBIN, BALANCE_LEAST_CONNECTIONS };
 
 struct server {
@@ -401,7 +424,18 @@ static bool fully_forwarded(const struct connection *connection) {
            direction_accounting_valid(up) && direction_accounting_valid(down);
 }
 
-static void remove_connection(struct server *server, struct connection *connection) {
+/* Safe for completely initialized, partially registered and already-closed
+ * endpoints. Each fd gets removed from epoll, cleared from by_fd, and closed
+ * at most once. Keeping this routine shared avoids diverging error paths. */
+static void release_connection_resources(struct server *server,
+                                         struct connection *connection) {
+    release_endpoint(server, &connection->client);
+    release_endpoint(server, &connection->backend);
+    close_connection_pipes(connection);
+}
+
+static void remove_connection(struct server *server, struct connection *connection,
+                              enum close_reason reason) {
     /* If the client vanishes before the health re-probe completes, allow a
      * later connection to try again; this attempt proves neither health nor
      * a backend fault. The original cooldown deadline remains unchanged. */
@@ -410,9 +444,7 @@ static void remove_connection(struct server *server, struct connection *connecti
     struct connection **cursor = &server->connections;
     while (*cursor != NULL && *cursor != connection) cursor = &(*cursor)->next;
     if (*cursor == connection) *cursor = connection->next;
-    release_endpoint(server, &connection->client);
-    release_endpoint(server, &connection->backend);
-    close_connection_pipes(connection);
+    release_connection_resources(server, connection);
     /* The connection is added to the list only after all setup succeeds.
      * Every listed connection owns exactly one active backend slot. */
     struct backend_target *target = &server->backends[connection->backend_index];
@@ -471,6 +503,11 @@ static void remove_connection(struct server *server, struct connection *connecti
            connection->to_client.pipe_pending,
            connection->to_backend.forwarded,
            connection->to_client.forwarded);
+    printf("connection-close-reason=%s; backend-index=%zu; "
+           "queued-to-backend=%zu; queued-to-client=%zu\n",
+           close_reason_name(reason), connection->backend_index,
+           direction_queued_bytes(&connection->to_backend),
+           direction_queued_bytes(&connection->to_client));
     printf("Released backend[%zu]=%s; backend-active=%zu; total-active=%zu\n",
            connection->backend_index, target->label,
            target->active_connections, server->active);
@@ -753,9 +790,7 @@ static bool attach_connection(struct server *server, int client) {
 fail:
     if (backend_selected)
         server->backends[connection->backend_index].probe_in_flight = false;
-    release_endpoint(server, &connection->client);
-    release_endpoint(server, &connection->backend);
-    close_connection_pipes(connection);
+    release_connection_resources(server, connection);
     free(connection);
     return false;
 }
@@ -872,13 +907,37 @@ static bool ready_for_clean_completion(const struct connection *connection) {
            fully_forwarded(connection);
 }
 
+/* SO_ERROR gives the pending socket error when epoll reports EPOLLERR.
+ * EPOLLHUP and EPOLLRDHUP alone are NOT aborts: ordinary FIN can generate
+ * readiness flags and must be drained normally through splice()/recv(). */
+static bool socket_has_fatal_error(const struct endpoint *endpoint) {
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (getsockopt(endpoint->fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
+        report_error("getsockopt(SO_ERROR after EPOLLERR)");
+        return true;
+    }
+    if (error == 0) return false;
+    errno = error;
+    /* A reset is expected in the Phase 23 fault tests. Keep the listener
+     * alive; ordinary unreset connections still use the normal EOF path. */
+    fprintf(stderr, "%s peer error: %s\n",
+            endpoint->is_client ? "client" : "backend", strerror(error));
+    return true;
+}
+
 static void dispatch_client_event(struct server *server, uint64_t token,
                                   uint32_t flags) {
     int fd = (int)(uint32_t)token;
     if (fd < 0 || (size_t)fd >= server->fd_capacity) return;
     struct endpoint *endpoint = server->by_fd[fd];
-    if (endpoint == NULL || endpoint->token != token) return; /* stale event */
+    /* epoll_wait() returns a BATCH. A previous event may have released this
+     * connection, and Linux may have reused its fd. Token equality prevents
+     * dereferencing freed memory or dispatching an event to the wrong peer. */
+    if (endpoint == NULL || endpoint->token != token) return;
     struct connection *connection = endpoint->owner;
+    enum close_reason endpoint_failure = endpoint->is_client ?
+                                          CLOSE_CLIENT_ABORT : CLOSE_BACKEND_ABORT;
     if (flags & EPOLLRDHUP) {
         if (endpoint->is_client) connection->client_rdhup_hint = true;
         else connection->backend_rdhup_hint = true;
@@ -886,19 +945,25 @@ static void dispatch_client_event(struct server *server, uint64_t token,
     if (connection->backend_state == BACKEND_CONNECTING) {
         if (endpoint->is_client) {
             bool ok = true;
-            if (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
+            if (flags & EPOLLERR) ok = !socket_has_fatal_error(endpoint);
+            if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)))
                 ok = stage_client_data(connection);
             track_client_fin(connection);
-            if (!ok || !update_interests(server, connection))
-                remove_connection(server, connection);
+            if (!ok) remove_connection(server, connection, CLOSE_CLIENT_ABORT);
+            else if (!update_interests(server, connection))
+                remove_connection(server, connection, CLOSE_INTERNAL_ERROR);
             return;
         }
         if (!(flags & (EPOLLOUT | EPOLLERR | EPOLLHUP))) return;
         if (!complete_backend_connect(server, connection)) {
-            remove_connection(server, connection);
+            remove_connection(server, connection, CLOSE_BACKEND_CONNECT_FAILURE);
             return;
         }
         /* Existing backend event may also carry normal readiness flags. */
+    }
+    if ((flags & EPOLLERR) && socket_has_fatal_error(endpoint)) {
+        remove_connection(server, connection, endpoint_failure);
+        return;
     }
     struct direction *incoming = endpoint->is_client ?
                                  &connection->to_backend : &connection->to_client;
@@ -906,30 +971,34 @@ static void dispatch_client_event(struct server *server, uint64_t token,
                                  &connection->to_client : &connection->to_backend;
     bool ok = true;
     if (flags & EPOLLOUT) ok = flush_spliced_direction(outgoing);
-    if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))) {
+    if (ok && (flags & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)))
         ok = read_spliced_direction(incoming);
+    if (!ok) {
+        remove_connection(server, connection, endpoint_failure);
+        return;
     }
-    if (ok && (!direction_accounting_valid(&connection->to_backend) ||
-               !direction_accounting_valid(&connection->to_client))) {
+    if (!direction_accounting_valid(&connection->to_backend) ||
+        !direction_accounting_valid(&connection->to_client)) {
         fputs("splice accounting invariant failed\n", stderr);
-        ok = false;
+        remove_connection(server, connection, CLOSE_INTERNAL_ERROR);
+        return;
     }
     track_client_fin(connection);
     track_backend_fin(connection);
-    if (ok && ready_for_clean_completion(connection)) {
+    if (ready_for_clean_completion(connection)) {
         puts("connection-completion=graceful; both-fins-forwarded=yes; "
              "queued-to-backend=0; queued-to-client=0");
         fflush(stdout);
-        remove_connection(server, connection);
+        remove_connection(server, connection, CLOSE_GRACEFUL);
         return;
     }
-    if (!ok || !update_interests(server, connection))
-        remove_connection(server, connection);
+    if (!update_interests(server, connection))
+        remove_connection(server, connection, CLOSE_INTERNAL_ERROR);
 }
 
 static void cleanup_server(struct server *server) {
     while (server->connections != NULL)
-        remove_connection(server, server->connections);
+        remove_connection(server, server->connections, CLOSE_SERVER_SHUTDOWN);
     if (server->listener >= 0) close(server->listener);
     if (server->epoll_fd >= 0) close(server->epoll_fd);
     free(server->by_fd);

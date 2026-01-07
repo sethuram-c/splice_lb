@@ -1,3 +1,71 @@
+# Phase 23 - Abrupt Disconnects and Centralized Cleanup
+
+Fedora Linux | C11 | epoll + splice | apply on top of **Phase 22**.
+
+## What changed
+
+- Treat fatal `EPOLLERR` as a connection-local failure and examine `SO_ERROR` on ready TCP sockets. **Do not** treat `EPOLLHUP` or `EPOLLRDHUP` alone as fatal: clean FINs must still drain through the existing half-close state machine.
+- Record a named teardown reason (`graceful`, `client-abort`, `backend-abort`, `backend-connect-failure`, `internal-error`, `server-shutdown`). The original Phase 22 accounting and completion logs are retained for regression compatibility.
+- Route all *listed* connection termination paths through `remove_connection(server, connection, reason)` and share `release_connection_resources()` with partial setup failure cleanup.
+- Unregister both endpoints from epoll, clear fd lookup slots, close both sockets and both pipe pairs, decrement per-backend and total active counts once, and free the connection.
+- Retain the fd+generation event token check: `epoll_wait()` can return a batch containing events referring to a connection already freed by a previous event in the batch.
+- Add real TCP RST tests using `SO_LINGER` with zero timeout on loopback, verify `/proc/<pid>/fd` returns to baseline, check listener survival, and perform a byte-exact healthy request afterward.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase23_changes.zip
+unzip -o ~/Downloads/phase23_changes.zip -d .
+make clean
+make
+python3 tests/test_abrupt_disconnects.py
+make test
+```
+
+Expected focused output:
+
+```text
+PASS: client-rst closes one session, releases all fds, listener serves next client
+PASS: backend-rst closes one session, releases all fds, listener serves next client
+PASS: repeated abrupt disconnects, stale events ignored, recovery byte-exact
+PASS: Phase 23 abrupt disconnects and centralized cleanup test suite
+```
+
+The prior Phase 2-18 suites passed in the execution environment before the combined command hit a time limit; the Phase 19-23 suites were subsequently run separately and passed. Always rerun `make test` on Fedora.
+
+## Manual test - three terminals
+
+```bash
+# Terminal 1: persistent backend
+make backend-multi
+# Terminal 2: multi-client proxy
+make run
+# Terminal 3: ordinary request
+./build/backend-client 127.0.0.1 9090 'phase 23 healthy request'
+```
+
+Expected echoed reply: `phase 23 healthy request`. Healthy completion prints `connection-close-reason=graceful` and `transfer-integrity=verified`. To force actual client/backend RST (rather than an orderly FIN), use `python3 tests/test_abrupt_disconnects.py`.
+
+## Inspect Linux behavior
+
+```bash
+# Inspect TCP socket states (while the process is running)
+ss -tan '( sport = :9090 or dport = :9090 )'
+# Inspect a running proxy's file descriptors
+PID=$(pidof splice-lb)
+ls -l /proc/$PID/fd
+# Restart the proxy under strace to see errors and resource cleanup
+strace -f -e trace=epoll_wait,epoll_ctl,splice,getsockopt,close \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+`pidof` finds the running process id; `/proc/$PID/fd` lists open descriptor symlinks. Run the traced proxy *instead of* `make run` (the same listen port cannot normally be bound twice). `strace` perturbs timings and is a debugging aid, not a benchmark. The accompanying learning PDF is personal study material and is not part of the source ZIP or Git repository.
+
+**Changed/new files:** `src/main.c`, `tests/test_abrupt_disconnects.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 22 - Backend Half-Close and Connection Completion
 
 Fedora Linux | C11 | Linux `epoll` and `splice()` | apply on top of **Phase 21**.

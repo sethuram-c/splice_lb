@@ -210,3 +210,18 @@
   - [x] Verify delayed-connect 0 B and 8 KiB uploads plus 4 MiB slow-backend upload
   - [x] Run Phase 2-21 regression suite with strict C build
   - [x] Keep the personal learning PDF outside Git and source ZIP
+
+- [x] Phase 22 - Backend half-close and connection completion
+  - [x] Track independent backend FIN states, drain pending responses before forwarding FIN
+  - [x] Keep receiving late client uploads after backend FIN and finish only when both streams complete
+  - [x] Verify backend-first FIN and 4 MiB slow-reader reply
+
+- [x] Phase 23 - Abrupt disconnects and centralized cleanup
+  - [x] Classify fatal socket EPOLLERR using SO_ERROR while preserving orderly EPOLLHUP/EPOLLRDHUP EOF
+  - [x] Reuse one connection teardown for graceful, client reset, backend reset, and failure paths
+  - [x] Reuse socket/pipe resource teardown during partial connection registration failures
+  - [x] Keep fd+generation token validation to guard against stale epoll batch events
+  - [x] Release both socket descriptors, both pipe pairs, epoll subscriptions and fd slots once
+  - [x] Verify per-backend active counts do not leak when client/backend resets happen
+  - [x] Test real TCP resets with SO_LINGER, /proc fd baseline and subsequent healthy forwarding
+  - [x] Validate earlier regression tests and keep the separate learning PDF outside the repo
