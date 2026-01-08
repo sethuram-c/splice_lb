@@ -95,7 +95,17 @@ enum backend_fin_state {
     BACKEND_FIN_OPEN, BACKEND_FIN_EOF_OBSERVED, BACKEND_FIN_FORWARDED
 };
 
+/* Phase 24: ownership states. A candidate is private during setup, becomes
+ * ACTIVE only after both epoll registrations succeed, and transitions to
+ * CLOSING before endpoints and memory are released. epoll callbacks only
+ * reference ACTIVE connections and validate their generation-bearing token.
+ */
+enum connection_lifecycle {
+    CONN_INITIALIZING, CONN_ACTIVE, CONN_CLOSING
+};
+
 struct connection {
+    enum connection_lifecycle lifecycle;
     enum backend_state backend_state;
     size_t preconnect_buffered; /* client bytes staged before SO_ERROR success */
     enum client_fin_state client_fin_state;
@@ -436,6 +446,15 @@ static void release_connection_resources(struct server *server,
 
 static void remove_connection(struct server *server, struct connection *connection,
                               enum close_reason reason) {
+    if (connection->lifecycle != CONN_ACTIVE) {
+        fputs("invalid connection lifecycle during teardown\n", stderr);
+        abort();
+    }
+    /* No event may dispatch to this connection once unregistration starts.
+     * The dispatch loop checks both token and lifecycle before dereferencing
+     * connection state; the object is freed only after all endpoint slots
+     * have been cleared. */
+    connection->lifecycle = CONN_CLOSING;
     /* If the client vanishes before the health re-probe completes, allow a
      * later connection to try again; this attempt proves neither health nor
      * a backend fault. The original cooldown deadline remains unchanged. */
@@ -704,12 +723,14 @@ static bool update_interests(struct server *server, struct connection *connectio
 
 static bool attach_connection(struct server *server, int client) {
     bool backend_selected = false;
+    const char *setup_stage = "allocation";
     struct connection *connection = calloc(1, sizeof(*connection));
     if (!connection) {
         report_error("calloc(connection)");
         close(client);
         return false;
     }
+    connection->lifecycle = CONN_INITIALIZING;
     connection->client.fd = client;
     connection->backend.fd = -1;
     connection->pipe_to_backend[0] = -1;
@@ -719,6 +740,7 @@ static bool attach_connection(struct server *server, int client) {
     connection->client.is_client = true;
     connection->client.owner = connection;
     connection->backend.owner = connection;
+    setup_stage = "backend-selection";
     if (!select_backend(server, &connection->backend_index)) {
         fputs("No healthy backends; rejecting client while targets cool down\n", stderr);
         goto fail;
@@ -731,7 +753,9 @@ static bool attach_connection(struct server *server, int client) {
            target->selections, target->active_connections,
            server->algorithm == BALANCE_LEAST_CONNECTIONS ? "least-connections" : "round-robin");
     fflush(stdout);
+    setup_stage = "client-nonblocking";
     if (!set_nonblocking(client)) goto fail;
+    setup_stage = "backend-socket";
     connection->backend.fd = socket(AF_INET, SOCK_STREAM, 0);
     if (connection->backend.fd < 0) {
         report_error("socket(backend)");
@@ -739,7 +763,9 @@ static bool attach_connection(struct server *server, int client) {
     }
     /* O_NONBLOCK must be set *before* connect(), otherwise a slow backend
      * can stall the whole epoll event loop. */
+    setup_stage = "backend-nonblocking";
     if (!set_nonblocking(connection->backend.fd)) goto fail;
+    setup_stage = "backend-connect";
     int connect_result = connect(connection->backend.fd,
                                  (const struct sockaddr *)&target->address,
                                  sizeof(target->address));
@@ -767,6 +793,7 @@ static bool attach_connection(struct server *server, int client) {
     connection->to_client.input_mode = INPUT_SPLICE_BIDIRECTIONAL;
     /* Both pipe pairs must exist before the connection is visible in epoll.
      * Any error takes the same cleanup path (including partially made pipes). */
+    setup_stage = "connection-pipes";
     if (!create_connection_pipes(connection)) goto fail;
     connection->to_backend.pipe_read_fd = connection->pipe_to_backend[0];
     connection->to_backend.pipe_write_fd = connection->pipe_to_backend[1];
@@ -775,8 +802,13 @@ static bool attach_connection(struct server *server, int client) {
     uint32_t client_events = EPOLLIN | EPOLLRDHUP; /* early bytes / FIN hint */
     uint32_t backend_events = connection->backend_state == BACKEND_READY ?
                               (EPOLLIN | EPOLLRDHUP) : EPOLLOUT;
-    if (!register_endpoint(server, &connection->client, client_events) ||
-        !register_endpoint(server, &connection->backend, backend_events)) goto fail;
+    setup_stage = "client-epoll-registration";
+    if (!register_endpoint(server, &connection->client, client_events)) goto fail;
+    setup_stage = "backend-epoll-registration";
+    if (!register_endpoint(server, &connection->backend, backend_events)) goto fail;
+    /* Publish only after BOTH endpoint registrations, pipes, and state are
+     * ready. No partially constructed connection owns an active slot. */
+    connection->lifecycle = CONN_ACTIVE;
     connection->next = server->connections;
     server->connections = connection;
     ++server->active;
@@ -788,6 +820,11 @@ static bool attach_connection(struct server *server, int client) {
     fflush(stdout);
     return true;
 fail:
+    /* A failed candidate never enters the published list and never claims
+     * a backend-active slot. Nonetheless it may own 0, 1, or 2 registered
+     * epoll endpoints, sockets, and a partially allocated pipe pair. */
+    fprintf(stderr, "connection-setup-failed=%s; rolling-back=yes\n", setup_stage);
+    connection->lifecycle = CONN_CLOSING;
     if (backend_selected)
         server->backends[connection->backend_index].probe_in_flight = false;
     release_connection_resources(server, connection);
@@ -936,6 +973,7 @@ static void dispatch_client_event(struct server *server, uint64_t token,
      * dereferencing freed memory or dispatching an event to the wrong peer. */
     if (endpoint == NULL || endpoint->token != token) return;
     struct connection *connection = endpoint->owner;
+    if (connection == NULL || connection->lifecycle != CONN_ACTIVE) return;
     enum close_reason endpoint_failure = endpoint->is_client ?
                                           CLOSE_CLIENT_ABORT : CLOSE_BACKEND_ABORT;
     if (flags & EPOLLRDHUP) {

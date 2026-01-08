@@ -1,3 +1,79 @@
+# Phase 24 - Safe Connection Lifetime and Partial Setup Failures
+
+Fedora Linux | C11 | nonblocking TCP | epoll | splice() | apply on top of **Phase 23**.
+
+## What changed
+
+- Add an explicit `CONN_INITIALIZING -> CONN_ACTIVE -> CONN_CLOSING` ownership lifecycle.
+- Keep a new connection private until **both** socket registrations have succeeded. Only then does it enter the live linked list and claim a backend-active slot.
+- Reject queued/stale epoll events unless the fd+generation token matches a registered endpoint **and** the owner is still `CONN_ACTIVE`.
+- Mark teardown `CONN_CLOSING` before unregistration, clearing fd lookup slots and closing sockets and both pipe pairs.
+- Log the failing setup stage and roll back an unpublished candidate without ever decrementing an active slot it did not acquire.
+- Introduce a test-only `LD_PRELOAD` interposer injecting one `EMFILE` at one of five stages: backend socket, first pipe, second pipe, client epoll registration, or backend epoll registration. The fault shim is **never** linked into the production proxy.
+- Verify the proxy keeps listening and forwards the next 12 KiB client request exactly after each injected failure. Check descriptor return to baseline using `/proc/<pid>/fd` and verify graceful cleanup.
+
+## Fedora verification
+
+Extract into your **Phase 23** repository, keeping the personal PDF outside Git:
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase24_changes.zip
+unzip -o ~/Downloads/phase24_changes.zip -d .
+make clean
+make
+make test-setup-failures
+make test
+```
+
+Expected focused test output:
+
+```text
+PASS: backend-socket rollback releases fds and recovers on next client
+PASS: pipe-first rollback releases fds and recovers on next client
+PASS: pipe-second rollback releases fds and recovers on next client
+PASS: epoll-client rollback releases fds and recovers on next client
+PASS: epoll-backend rollback releases fds and recovers on next client
+PASS: Phase 24 safe connection lifetime and partial setup test suite
+```
+
+`make test` builds the test-only `build/setup-faults.so` and executes all Phase 2-24 suites. The normal `make` target builds only the production proxy and its demo utilities, not the interposer.
+
+## Manual verification - three terminals
+
+```bash
+# Terminal 1: persistent backend
+make backend-multi
+# Terminal 2: proxy
+make run
+# Terminal 3: ordinary client
+./build/backend-client 127.0.0.1 9090 "hello phase 24"
+```
+
+Expected echoed reply: `hello phase 24`. A normal completion logs `connection-completion=graceful` and `transfer-integrity=verified`. Use `make test-setup-failures` to prove actual injected errors, since the ordinary demo does not intentionally fail setup.
+
+## How the failure test works
+
+The `tests/setup_faults.c` shared library is loaded **only in the test proxy subprocess** through `LD_PRELOAD`. It intercepts Linux `socket()`, `pipe2()`, and `epoll_ctl(EPOLL_CTL_ADD)` and fails one call with `EMFILE` (simulated fd exhaustion); every later call passes through to the kernel. An isolated test process is created per stage so counters cannot carry over. `tests/test_setup_failures.py` confirms injection actually occurred through a temporary marker, then checks that the proxy returns to its idle fd baseline and successfully serves the next client.
+
+`LD_PRELOAD` usually works in a normal unprivileged Fedora shell. It is ignored in some secure-execution contexts; tests will fail explicitly if the injection marker is absent. Do **not** globally set `LD_PRELOAD` in your interactive shell.
+
+## Useful Linux commands
+
+```bash
+PID=$(pidof splice-lb)
+ls -l /proc/$PID/fd
+ss -tan '( sport = :9090 or dport = :9090 )'
+strace -f -e trace=socket,pipe2,epoll_ctl,close \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+Trace the proxy **instead of** `make run`, not simultaneously, to avoid port conflicts. `strace` changes timing and is for debugging, not performance measurement.
+
+**Changed/new files:** `src/main.c`, `tests/setup_faults.c`, `tests/test_setup_failures.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 23 - Abrupt Disconnects and Centralized Cleanup
 
 Fedora Linux | C11 | epoll + splice | apply on top of **Phase 22**.

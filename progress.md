@@ -225,3 +225,14 @@
   - [x] Verify per-backend active counts do not leak when client/backend resets happen
   - [x] Test real TCP resets with SO_LINGER, /proc fd baseline and subsequent healthy forwarding
   - [x] Validate earlier regression tests and keep the separate learning PDF outside the repo
+
+
+- [x] Phase 24 - Safe connection lifetime and partial setup failures
+  - [x] Add initializing/active/closing lifecycle and publish only after complete socket, pipe and epoll setup
+  - [x] Reject stale events with fd+generation token and active-lifecycle guard
+  - [x] Mark closing before clearing endpoint slots and releasing every socket/pipe fd
+  - [x] Roll back unpublished candidates without decrementing unacquired backend active slots
+  - [x] Add test-only LD_PRELOAD syscall failure shim (backend socket, two pipe stages, two epoll stages)
+  - [x] Verify exactly one injected failure per proxy process, restored fd baseline and byte-exact recovery on the next client
+  - [x] Pass all Phase 2-24 regressions in two test batches under strict C compiler flags
+  - [x] Deliver personal learning PDF outside source ZIP and Git repository

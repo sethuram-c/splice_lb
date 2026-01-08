@@ -7,6 +7,7 @@ SERVER := build/splice-lb
 CLIENT := build/backend-client
 ECHO := build/echo-backend
 SPLICE_DEMO := build/splice-demo
+SETUP_FAULTS := build/setup-faults.so
 
 .PHONY: all clean test run
 all: $(SERVER) $(CLIENT) $(ECHO) $(SPLICE_DEMO)
@@ -27,6 +28,15 @@ $(ECHO): src/echo_backend.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
+# Test-only fault injector, never linked into production executable.
+$(SETUP_FAULTS): tests/setup_faults.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@
+
+.PHONY: test-setup-failures
+test-setup-failures: all $(SETUP_FAULTS)
+	python3 tests/test_setup_failures.py
+
 # Terminal A: make backend (or ./build/echo-backend 9091)
 # Terminal B: make run
 .PHONY: backend
@@ -45,7 +55,7 @@ backend-rr:
 run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
-test: all
+test: all $(SETUP_FAULTS)
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
@@ -68,6 +78,7 @@ test: all
 	python3 tests/test_client_eof.py
 	python3 tests/test_backend_eof.py
 	python3 tests/test_abrupt_disconnects.py
+	python3 tests/test_setup_failures.py
 
 clean:
 	rm -rf build
