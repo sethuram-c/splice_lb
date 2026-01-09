@@ -1,3 +1,89 @@
+# Phase 25 - Command-Line Configuration and Validation
+
+Fedora Linux | C11 | nonblocking TCP | `epoll` | `splice()` | apply on top of **Phase 24**.
+
+## What changed
+
+- Add strict, explicit options before the existing positional listener/backend arguments: `--listen-ip` (default `127.0.0.1`), `--backlog` (1..4096, default 128), and `--backend-retry-ms` (100..60000, default 3000). Keep `--algorithm` from Phase 18.
+- Accept `--name=value` and `--name value`; reject duplicates, unknown options, missing values, signs/whitespace, overflows, bad IPv4 addresses, duplicate backend addresses and self-routing to the local listener.
+- Preserve the legacy CLI: `./build/splice-lb 9090 127.0.0.1 9091`; Round Robin remains default and listen port `0` requests an ephemeral port.
+- Bind to the specified local IPv4 address, pass the selected backlog to `listen()`, and use the selected cooldown for the monotonic-clock backend quarantine implemented in Phase 19.
+- Print the effective options at startup without changing the original `Listening on ...` line used by existing test harnesses.
+- Add a focused test verifying 29 rejected inputs, option syntax, loopback address isolation, binary integrity, the old CLI, and real recovery after a 200 ms failure cooldown.
+
+## Fedora verification
+
+Apply the Phase 25 ZIP **over Phase 24**, not a new empty directory. Keep `phase25_learning_guide.pdf` outside Git.
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase25_changes.zip
+unzip -o ~/Downloads/phase25_changes.zip -d .
+make clean
+make
+make test-config
+make test
+```
+
+Expected focused ending: `PASS: Phase 25 command-line configuration and validation test suite`.
+`make test` includes all earlier suites, and builds the Phase 24 test-only fault-injection library before running them.
+
+## Manual test (three terminals)
+
+Terminal 1, identifiable backend:
+
+```bash
+make backend-rr
+```
+
+Terminal 2, configurable proxy:
+
+```bash
+./build/splice-lb \
+  --algorithm=least-connections \
+  --listen-ip 127.0.0.1 \
+  --backlog=256 \
+  --backend-retry-ms 1200 \
+  9090 127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+Terminal 3, client:
+
+```bash
+./build/backend-client 127.0.0.1 9090 'hello phase 25'
+```
+
+Expected response begins `backend-0|`, `backend-1|`, or `backend-2|` depending on selection. Proxy prints `Configuration listen-ip=127.0.0.1; backlog=256; backend-retry-ms=1200; algorithm=least-connections`.
+
+## Available flags
+
+| Flag | Default | Range / values |
+|---|---|---|
+| `--algorithm` | `round-robin` | `round-robin` or `least-connections` |
+| `--listen-ip` | `127.0.0.1` | numeric IPv4 address |
+| `--backlog` | `128` | integer 1..4096 |
+| `--backend-retry-ms` | `3000` | integer 100..60000 |
+| positional listen port | required | 0..65535 (`0` = OS-selected) |
+| positional backends | required | 1..32 unique `IPv4:port` |
+
+**Important:** `--listen-ip 0.0.0.0` makes the listener reachable on all IPv4 interfaces, subject to firewall rules. For development, prefer `127.0.0.1`. Linux may cap the requested listen backlog using `/proc/sys/net/core/somaxconn`. The retry interval is a quarantine after TCP connection failure, not a connection timeout (Phase 26 adds timeouts).
+
+## Inspection commands and interpretation
+
+```bash
+./build/splice-lb --help
+ss -ltn '( sport = :9090 )'
+sysctl net.core.somaxconn
+strace -f -e trace=socket,bind,listen,connect,getsockopt \
+  ./build/splice-lb --backlog 256 9090 127.0.0.1:9091
+```
+
+Run `strace` instead of a second proxy instance; only one proxy should bind port 9090 at a time. `ss` shows local listener and queue information; effective queue capacity can differ from user-space configured backlog. `sysctl` reports the kernel's listen-backlog cap (not a command to change it).
+
+**New/changed files:** `src/main.c`, `tests/test_cli_config.py`, `Makefile`, `README.md`, `progress.md`. No PDF in the ZIP or Git repository.
+
+---
+
 # Phase 24 - Safe Connection Lifetime and Partial Setup Failures
 
 Fedora Linux | C11 | nonblocking TCP | epoll | splice() | apply on top of **Phase 23**.

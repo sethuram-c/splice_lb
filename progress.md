@@ -1,3 +1,16 @@
+# Phase 25 - Command-Line Configuration and Validation
+
+**Planned commit:** 2026-12-09 21:52:18 +05:30. **Status:** implemented and validated in Linux test environment; verify on Fedora before committing.
+
+- Added configurable listen IPv4, listen backlog, backend retry cooldown; preserved algorithm selection and legacy CLI.
+- Strict numeric, IPv4, repeated-flag, duplicate-backend, and self-routing validation.
+- Build: `make clean && make`. Focused tests: `make test-config`.
+- Verified 29 invalid cases, `127.0.0.2` bind isolation, legacy API, binary integrity, and 200 ms recovery.
+- Earlier regression suites Phase 2-23 passed in batches. Phase 24 fault injection passed after `make build/setup-faults.so`, and Phase 25 tests passed. Run `make test` on Fedora.
+- Learning guide PDF is personal learning material outside the repository.
+
+---
+
 ## Phase 22 - Backend half-close and connection completion (2026-12-06)
 
 - Distinguish observed backend EOF from FIN forwarded to the client. Treat `EPOLLRDHUP` only as a readiness hint; `splice() == 0` confirms source EOF.

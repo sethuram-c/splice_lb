@@ -33,6 +33,10 @@ $(SETUP_FAULTS): tests/setup_faults.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@
 
+.PHONY: test-config
+test-config: all
+	python3 tests/test_cli_config.py
+
 .PHONY: test-setup-failures
 test-setup-failures: all $(SETUP_FAULTS)
 	python3 tests/test_setup_failures.py
@@ -79,6 +83,7 @@ test: all $(SETUP_FAULTS)
 	python3 tests/test_backend_eof.py
 	python3 tests/test_abrupt_disconnects.py
 	python3 tests/test_setup_failures.py
+	python3 tests/test_cli_config.py
 
 clean:
 	rm -rf build

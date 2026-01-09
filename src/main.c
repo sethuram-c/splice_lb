@@ -151,6 +151,9 @@ enum balance_algorithm { BALANCE_ROUND_ROBIN, BALANCE_LEAST_CONNECTIONS };
 
 struct server {
     enum balance_algorithm algorithm;
+    struct in_addr listen_address; /* explicit bind address; loopback by default */
+    int listen_backlog;
+    uint64_t backend_retry_delay_ms;
     int listener;
     int epoll_fd;
     struct backend_target backends[MAX_BACKENDS];
@@ -203,6 +206,23 @@ static bool parse_backend_spec(const char *text, struct backend_target *target) 
     return true;
 }
 
+/* Strict decimal-only CLI values: reject signs, spaces, empty text and overflow. */
+static bool parse_bounded_uint(const char *text, unsigned min_value,
+                               unsigned max_value, unsigned *result) {
+    if (text == NULL || *text == '\0') return false;
+    for (const unsigned char *cursor = (const unsigned char *)text;
+         *cursor != '\0'; ++cursor) {
+        if (*cursor < '0' || *cursor > '9') return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || *end != '\0' || value < min_value ||
+        value > max_value) return false;
+    *result = (unsigned)value;
+    return true;
+}
+
 static void report_error(const char *call);
 
 /* All health deadlines use monotonic time, never wall-clock timestamps.
@@ -226,13 +246,13 @@ static void mark_backend_connect_failed(struct server *server, size_t index,
     ++target->connect_failures;
     target->probe_in_flight = false;
     if (monotonic_ms(&now))
-        target->retry_after_ms = now + BACKEND_RETRY_DELAY_MS;
+        target->retry_after_ms = now + server->backend_retry_delay_ms;
     else
         target->retry_after_ms = UINT64_MAX;
     fprintf(stderr, "Backend[%zu]=%s connect failure: %s; "
             "cooldown-ms=%llu; failures=%" PRIu64 "\n",
             index, target->label, strerror(error),
-            (unsigned long long)BACKEND_RETRY_DELAY_MS,
+            (unsigned long long)server->backend_retry_delay_ms,
             target->connect_failures);
 }
 
@@ -1051,34 +1071,68 @@ int main(int argc, char **argv) {
     }
     uint16_t listen_port;
     struct server server = {.listener = -1, .epoll_fd = -1};
+    server.listen_address.s_addr = htonl(INADDR_LOOPBACK);
+    server.listen_backlog = LISTEN_BACKLOG;
+    server.backend_retry_delay_ms = BACKEND_RETRY_DELAY_MS;
     int arg = 1;
-    /* Phase 18: accept both --algorithm NAME and --algorithm=NAME.
-     * Preserve legacy positional startup and reject repeated selectors. */
+    bool seen_algorithm = false, seen_listen_ip = false;
+    bool seen_backlog = false, seen_retry_ms = false;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-        printf("Usage: %s [--algorithm round-robin|least-connections] "
-               "<listen-port> <IPv4:port> [IPv4:port ...]\n"
-               "       %s <listen-port> <backend-IPv4> <backend-port>\n"
-               "       Alternative: --algorithm=round-robin|least-connections\n"
-               "       --help displays this message; listen port 0 picks a free port.\n",
-               argv[0], argv[0]);
+        printf("Usage: %s [OPTIONS] <listen-port> <IPv4:port> [IPv4:port ...]\n"
+               "       %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
+               "Options (must precede positional arguments):\n"
+               "  --algorithm NAME          round-robin (default) | least-connections\n"
+               "  --listen-ip IPv4          bind address (default 127.0.0.1)\n"
+               "  --backlog N               pending accept queue hint, 1..4096 (default 128)\n"
+               "  --backend-retry-ms N      failed-backend cooldown, 100..60000 (default 3000)\n"
+               "  --help                    show this help; standalone only\n"
+               "Each option also supports --name=value; up to %u backends.\n"
+               "Listen port 0 requests an ephemeral port; backend port 0 is invalid.\n"
+               "WARNING: --listen-ip 0.0.0.0 accepts remote connections if firewall allows.\n",
+               argv[0], argv[0], (unsigned)MAX_BACKENDS);
         return EXIT_SUCCESS;
     }
-    const char *requested_algorithm = NULL;
-    if (argc > 1 && strcmp(argv[1], "--algorithm") == 0) {
-        if (argc < 3) goto usage;
-        requested_algorithm = argv[2];
-        arg = 3;
-    } else if (argc > 1 && strncmp(argv[1], "--algorithm=", 12) == 0) {
-        requested_algorithm = argv[1] + 12;
-        arg = 2;
-    }
-    if (requested_algorithm != NULL) {
-        if (strcmp(requested_algorithm, "least-connections") == 0)
-            server.algorithm = BALANCE_LEAST_CONNECTIONS;
-        else if (strcmp(requested_algorithm, "round-robin") == 0)
-            server.algorithm = BALANCE_ROUND_ROBIN;
-        else
-            goto usage;
+    /* Options come before positional arguments. An option can appear once,
+     * using either --key value or --key=value. No implicit env overrides. */
+    while (arg < argc && strncmp(argv[arg], "--", 2) == 0) {
+        const char *option = argv[arg];
+        const char *equals = strchr(option, '=');
+        size_t key_len = equals == NULL ? strlen(option) : (size_t)(equals - option);
+        const char *value = equals != NULL ? equals + 1 : NULL;
+        if (equals == NULL) {
+            if (arg + 1 >= argc) goto usage;
+            value = argv[++arg];
+        }
+        if (key_len == strlen("--algorithm") &&
+            strncmp(option, "--algorithm", key_len) == 0) {
+            if (seen_algorithm) goto usage;
+            seen_algorithm = true;
+            if (strcmp(value, "round-robin") == 0)
+                server.algorithm = BALANCE_ROUND_ROBIN;
+            else if (strcmp(value, "least-connections") == 0)
+                server.algorithm = BALANCE_LEAST_CONNECTIONS;
+            else goto usage;
+        } else if (key_len == strlen("--listen-ip") &&
+                   strncmp(option, "--listen-ip", key_len) == 0) {
+            if (seen_listen_ip || inet_pton(AF_INET, value,
+                                           &server.listen_address) != 1) goto usage;
+            seen_listen_ip = true;
+        } else if (key_len == strlen("--backlog") &&
+                   strncmp(option, "--backlog", key_len) == 0) {
+            unsigned number;
+            if (seen_backlog || !parse_bounded_uint(value, 1U, 4096U, &number))
+                goto usage;
+            seen_backlog = true;
+            server.listen_backlog = (int)number;
+        } else if (key_len == strlen("--backend-retry-ms") &&
+                   strncmp(option, "--backend-retry-ms", key_len) == 0) {
+            unsigned number;
+            if (seen_retry_ms || !parse_bounded_uint(value, 100U, 60000U,
+                                                     &number)) goto usage;
+            seen_retry_ms = true;
+            server.backend_retry_delay_ms = (uint64_t)number;
+        } else goto usage;
+        ++arg;
     }
     if (argc - arg < 2 || !parse_port(argv[arg], true, &listen_port)) goto usage;
 
@@ -1102,16 +1156,32 @@ int main(int argc, char **argv) {
             ++server.backend_count;
         }
     }
+    /* Reject duplicate targets: without this, the same address appears as
+     * multiple logical backends and biases connection-level distribution. */
+    for (size_t i = 0; i < server.backend_count; ++i) {
+        for (size_t j = i + 1; j < server.backend_count; ++j) {
+            if (server.backends[i].address.sin_addr.s_addr ==
+                    server.backends[j].address.sin_addr.s_addr &&
+                server.backends[i].address.sin_port ==
+                    server.backends[j].address.sin_port) goto usage;
+        }
+        /* An exact self-route with a fixed port loops proxy traffic back
+         * to the listener; forbid it before creating any socket. */
+        if (listen_port != 0 &&
+            server.backends[i].address.sin_port == htons(listen_port) &&
+            (server.backends[i].address.sin_addr.s_addr ==
+                 server.listen_address.s_addr ||
+             server.listen_address.s_addr == htonl(INADDR_ANY))) goto usage;
+    }
     goto parsed;
 usage:
-    fprintf(stderr, "Usage: %s <listen-port: 0-65535> "
-                    "<backend-IPv4> <backend-port: 1-65535>\n"
-                    "   or: %s <listen-port: 0-65535> "
-                    "<backend-IPv4:port> [backend-IPv4:port ...] (max %u)\n"
-                    "   optional prefix: --algorithm round-robin|least-connections\n"
-                    "   or: --algorithm=round-robin|least-connections\n"
-                    "   for help: --help\n",
-            argv[0], argv[0], (unsigned)MAX_BACKENDS);
+    fprintf(stderr, "Usage: %s [--algorithm round-robin|least-connections] "
+                    "[--listen-ip IPv4] [--backlog 1..4096] "
+                    "[--backend-retry-ms 100..60000] <listen-port: 0-65535> "
+                    "<IPv4:port> [IPv4:port ...] (max %u)\n"
+                    "   legacy: %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
+                    "   options may use --name=value; use --help for details\n",
+            argv[0], (unsigned)MAX_BACKENDS, argv[0]);
     return EXIT_FAILURE;
 parsed: ;
     int result = EXIT_FAILURE;
@@ -1125,12 +1195,12 @@ parsed: ;
     if (!set_nonblocking(server.listener)) goto done;
     struct sockaddr_in local = {0};
     local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_addr = server.listen_address;
     local.sin_port = htons(listen_port);
     if (bind(server.listener, (const struct sockaddr *)&local, sizeof(local)) < 0) {
         report_error("bind()"); goto done;
     }
-    if (listen(server.listener, LISTEN_BACKLOG) < 0) { report_error("listen()"); goto done; }
+    if (listen(server.listener, server.listen_backlog) < 0) { report_error("listen()"); goto done; }
     socklen_t size = sizeof(local);
     if (getsockname(server.listener, (struct sockaddr *)&local, &size) < 0) {
         report_error("getsockname()"); goto done;
@@ -1140,17 +1210,28 @@ parsed: ;
     struct epoll_event listener_event = {.events = EPOLLIN, .data.u64 = 0};
     if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, server.listener,
                   &listener_event) < 0) { report_error("epoll_ctl(listener)"); goto done; }
+    char listen_ip[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &server.listen_address, listen_ip,
+                  sizeof(listen_ip)) == NULL) {
+        report_error("inet_ntop(listen-ip)"); goto done;
+    }
     if (server.backend_count == 1) {
-        printf("Listening on 127.0.0.1:%u -> %s\n",
+        printf("Listening on %s:%u -> %s\n",
+               listen_ip,
                (unsigned)ntohs(local.sin_port), server.backends[0].label);
     } else {
-        printf("Listening on 127.0.0.1:%u -> %s (%zu backends)\n",
-               (unsigned)ntohs(local.sin_port),
+        printf("Listening on %s:%u -> %s (%zu backends)\n",
+               listen_ip, (unsigned)ntohs(local.sin_port),
                server.algorithm == BALANCE_LEAST_CONNECTIONS ?
                "least-connections" : "round-robin", server.backend_count);
         for (size_t i = 0; i < server.backend_count; ++i)
             printf("Backend[%zu]=%s\n", i, server.backends[i].label);
     }
+    printf("Configuration listen-ip=%s; backlog=%d; backend-retry-ms=%" PRIu64
+           "; algorithm=%s\n", listen_ip, server.listen_backlog,
+           server.backend_retry_delay_ms,
+           server.algorithm == BALANCE_LEAST_CONNECTIONS ?
+           "least-connections" : "round-robin");
     fflush(stdout);
 
     struct epoll_event events[EVENT_BATCH];
