@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -25,6 +26,8 @@
 /* A refused connect removes the backend from new selections for three seconds.
  * Next request after expiry is a single natural traffic probe, not a timer. */
 #define BACKEND_RETRY_DELAY_MS 3000ULL
+#define DEFAULT_CONNECT_TIMEOUT_MS 5000ULL
+#define DEFAULT_IDLE_TIMEOUT_MS 60000ULL
 
 struct backend_target {
     struct sockaddr_in address;
@@ -75,6 +78,7 @@ struct direction {
     size_t offset;
     size_t pending;
     uint64_t forwarded;
+    uint64_t *last_progress_ms; /* shared connection activity clock */
     /* Bytes delivered through send() from the preconnect staging queue.
      * Together with spliced_from_pipe, this must equal forwarded. */
     uint64_t staged_sent;
@@ -107,6 +111,8 @@ enum connection_lifecycle {
 struct connection {
     enum connection_lifecycle lifecycle;
     enum backend_state backend_state;
+    uint64_t connect_started_ms; /* unchanged by early client data */
+    uint64_t last_progress_ms; /* refreshed on successful TCP byte movement */
     size_t preconnect_buffered; /* client bytes staged before SO_ERROR success */
     enum client_fin_state client_fin_state;
     bool client_rdhup_hint; /* EPOLLRDHUP is a hint; not proof input was drained */
@@ -131,6 +137,8 @@ enum close_reason {
     CLOSE_CLIENT_ABORT,
     CLOSE_BACKEND_ABORT,
     CLOSE_BACKEND_CONNECT_FAILURE,
+    CLOSE_BACKEND_CONNECT_TIMEOUT,
+    CLOSE_IDLE_TIMEOUT,
     CLOSE_INTERNAL_ERROR,
     CLOSE_SERVER_SHUTDOWN
 };
@@ -141,6 +149,8 @@ static const char *close_reason_name(enum close_reason reason) {
     case CLOSE_CLIENT_ABORT: return "client-abort";
     case CLOSE_BACKEND_ABORT: return "backend-abort";
     case CLOSE_BACKEND_CONNECT_FAILURE: return "backend-connect-failure";
+    case CLOSE_BACKEND_CONNECT_TIMEOUT: return "backend-connect-timeout";
+    case CLOSE_IDLE_TIMEOUT: return "idle-timeout";
     case CLOSE_INTERNAL_ERROR: return "internal-error";
     case CLOSE_SERVER_SHUTDOWN: return "server-shutdown";
     }
@@ -154,6 +164,8 @@ struct server {
     struct in_addr listen_address; /* explicit bind address; loopback by default */
     int listen_backlog;
     uint64_t backend_retry_delay_ms;
+    uint64_t connect_timeout_ms;
+    uint64_t idle_timeout_ms;
     int listener;
     int epoll_fd;
     struct backend_target backends[MAX_BACKENDS];
@@ -233,6 +245,15 @@ static bool monotonic_ms(uint64_t *now) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) return false;
     *now = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
     return true;
+}
+
+/* Only positive byte movement counts as activity, never epoll readiness,
+ * EAGAIN, or a noisy EPOLLRDHUP hint. The initial clock is set at setup.
+ * A pending backend handshake uses its independent CONNECT deadline. */
+static void mark_direction_progress(struct direction *direction) {
+    uint64_t now;
+    if (direction->last_progress_ms != NULL && monotonic_ms(&now))
+        *direction->last_progress_ms = now;
 }
 
 /* A failed TCP handshake is connection-local, but it also temporarily
@@ -575,6 +596,7 @@ static bool flush_direction(struct direction *direction) {
             direction->pending -= (size_t)written;
             direction->forwarded += (uint64_t)written;
             direction->staged_sent += (uint64_t)written;
+            mark_direction_progress(direction);
         } else if (written < 0 && errno == EINTR) {
             continue;
         } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -608,6 +630,7 @@ static bool drain_pipe_to_socket(struct direction *direction) {
             direction->pipe_pending -= (size_t)sent;
             direction->spliced_from_pipe += (uint64_t)sent;
             direction->forwarded += (uint64_t)sent;
+            mark_direction_progress(direction);
             direction->drain_blocked = false;
             continue;
         }
@@ -658,6 +681,7 @@ static bool read_spliced_direction(struct direction *direction) {
             if ((size_t)got < requested) ++direction->partial_pipe_writes;
             direction->pipe_pending += (size_t)got;
             direction->spliced_to_pipe += (uint64_t)got;
+            mark_direction_progress(direction);
             record_queued_peak(direction);
             continue;
         }
@@ -689,6 +713,7 @@ static bool stage_client_data(struct connection *connection) {
             direction->offset = 0;
             direction->pending = (size_t)got;
             connection->preconnect_buffered += (size_t)got;
+            mark_direction_progress(direction);
             record_queued_peak(direction);
             return true;
         }
@@ -760,6 +785,14 @@ static bool attach_connection(struct server *server, int client) {
     connection->client.is_client = true;
     connection->client.owner = connection;
     connection->backend.owner = connection;
+    setup_stage = "monotonic-clock";
+    if (!monotonic_ms(&connection->connect_started_ms)) {
+        report_error("clock_gettime(CLOCK_MONOTONIC)");
+        goto fail;
+    }
+    connection->last_progress_ms = connection->connect_started_ms;
+    connection->to_backend.last_progress_ms = &connection->last_progress_ms;
+    connection->to_client.last_progress_ms = &connection->last_progress_ms;
     setup_stage = "backend-selection";
     if (!select_backend(server, &connection->backend_index)) {
         fputs("No healthy backends; rejecting client while targets cool down\n", stderr);
@@ -886,6 +919,10 @@ static bool complete_backend_connect(struct server *server,
         return false;
     }
     connection->backend_state = BACKEND_READY;
+    if (!monotonic_ms(&connection->last_progress_ms)) {
+        report_error("clock_gettime(CLOCK_MONOTONIC)");
+        return false;
+    }
     struct backend_target *target = &server->backends[connection->backend_index];
     if (target->probe_in_flight) {
         printf("Backend[%zu]=%s recovered after successful TCP handshake\n",
@@ -1054,6 +1091,56 @@ static void dispatch_client_event(struct server *server, uint64_t token,
         remove_connection(server, connection, CLOSE_INTERNAL_ERROR);
 }
 
+/* epoll_wait() can sleep only until the earliest deadline. All session
+ * deadlines use CLOCK_MONOTONIC, unaffected by wall-clock adjustments.
+ * When there are no connections, -1 preserves the original event-driven sleep.
+ * This initial O(connections) sweep is benchmarked for scalability later. */
+static uint64_t connection_deadline(const struct server *server,
+                                    const struct connection *connection) {
+    if (connection->backend_state == BACKEND_CONNECTING)
+        return connection->connect_started_ms + server->connect_timeout_ms;
+    return connection->last_progress_ms + server->idle_timeout_ms;
+}
+
+static int epoll_deadline_wait_ms(const struct server *server, uint64_t now) {
+    if (server->connections == NULL) return -1;
+    uint64_t nearest = UINT64_MAX;
+    for (const struct connection *c = server->connections; c; c = c->next) {
+        uint64_t expiry = connection_deadline(server, c);
+        if (expiry < nearest) nearest = expiry;
+    }
+    if (nearest <= now) return 0;
+    uint64_t remaining = nearest - now;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+/* Save next before teardown: remove_connection() frees the current object.
+ * Session expiration never changes the listener's lifetime. Mark a timed-out
+ * backend unhealthy just as a failed SO_ERROR handshake would. */
+static void expire_connections(struct server *server, uint64_t now) {
+    struct connection *connection = server->connections;
+    while (connection != NULL) {
+        struct connection *next = connection->next;
+        if (now >= connection_deadline(server, connection)) {
+            if (connection->backend_state == BACKEND_CONNECTING) {
+                fprintf(stderr, "backend-connect-timeout backend-index=%zu; "
+                        "elapsed-ms=%" PRIu64 "\n",
+                        connection->backend_index,
+                        now - connection->connect_started_ms);
+                mark_backend_connect_failed(server, connection->backend_index,
+                                            ETIMEDOUT);
+                remove_connection(server, connection, CLOSE_BACKEND_CONNECT_TIMEOUT);
+            } else {
+                fprintf(stderr, "idle-timeout backend-index=%zu; "
+                        "quiet-ms=%" PRIu64 "\n",
+                        connection->backend_index, now - connection->last_progress_ms);
+                remove_connection(server, connection, CLOSE_IDLE_TIMEOUT);
+            }
+        }
+        connection = next;
+    }
+}
+
 static void cleanup_server(struct server *server) {
     while (server->connections != NULL)
         remove_connection(server, server->connections, CLOSE_SERVER_SHUTDOWN);
@@ -1074,9 +1161,12 @@ int main(int argc, char **argv) {
     server.listen_address.s_addr = htonl(INADDR_LOOPBACK);
     server.listen_backlog = LISTEN_BACKLOG;
     server.backend_retry_delay_ms = BACKEND_RETRY_DELAY_MS;
+    server.connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS;
+    server.idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
     int arg = 1;
     bool seen_algorithm = false, seen_listen_ip = false;
     bool seen_backlog = false, seen_retry_ms = false;
+    bool seen_connect_timeout = false, seen_idle_timeout = false;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         printf("Usage: %s [OPTIONS] <listen-port> <IPv4:port> [IPv4:port ...]\n"
                "       %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
@@ -1085,6 +1175,8 @@ int main(int argc, char **argv) {
                "  --listen-ip IPv4          bind address (default 127.0.0.1)\n"
                "  --backlog N               pending accept queue hint, 1..4096 (default 128)\n"
                "  --backend-retry-ms N      failed-backend cooldown, 100..60000 (default 3000)\n"
+               "  --connect-timeout-ms N   backend handshake timeout, 100..120000 (default 5000)\n"
+               "  --idle-timeout-ms N      no byte progress timeout, 100..3600000 (default 60000)\n"
                "  --help                    show this help; standalone only\n"
                "Each option also supports --name=value; up to %u backends.\n"
                "Listen port 0 requests an ephemeral port; backend port 0 is invalid.\n"
@@ -1131,6 +1223,20 @@ int main(int argc, char **argv) {
                                                      &number)) goto usage;
             seen_retry_ms = true;
             server.backend_retry_delay_ms = (uint64_t)number;
+        } else if (key_len == strlen("--connect-timeout-ms") &&
+                   strncmp(option, "--connect-timeout-ms", key_len) == 0) {
+            unsigned number;
+            if (seen_connect_timeout || !parse_bounded_uint(value, 100U, 120000U,
+                                                              &number)) goto usage;
+            seen_connect_timeout = true;
+            server.connect_timeout_ms = (uint64_t)number;
+        } else if (key_len == strlen("--idle-timeout-ms") &&
+                   strncmp(option, "--idle-timeout-ms", key_len) == 0) {
+            unsigned number;
+            if (seen_idle_timeout || !parse_bounded_uint(value, 100U, 3600000U,
+                                                           &number)) goto usage;
+            seen_idle_timeout = true;
+            server.idle_timeout_ms = (uint64_t)number;
         } else goto usage;
         ++arg;
     }
@@ -1177,7 +1283,9 @@ int main(int argc, char **argv) {
 usage:
     fprintf(stderr, "Usage: %s [--algorithm round-robin|least-connections] "
                     "[--listen-ip IPv4] [--backlog 1..4096] "
-                    "[--backend-retry-ms 100..60000] <listen-port: 0-65535> "
+                    "[--backend-retry-ms 100..60000] "
+                    "[--connect-timeout-ms 100..120000] "
+                    "[--idle-timeout-ms 100..3600000] <listen-port: 0-65535> "
                     "<IPv4:port> [IPv4:port ...] (max %u)\n"
                     "   legacy: %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
                     "   options may use --name=value; use --help for details\n",
@@ -1228,15 +1336,24 @@ parsed: ;
             printf("Backend[%zu]=%s\n", i, server.backends[i].label);
     }
     printf("Configuration listen-ip=%s; backlog=%d; backend-retry-ms=%" PRIu64
-           "; algorithm=%s\n", listen_ip, server.listen_backlog,
+           "; algorithm=%s; connect-timeout-ms=%" PRIu64
+           "; idle-timeout-ms=%" PRIu64 "\n", listen_ip, server.listen_backlog,
            server.backend_retry_delay_ms,
            server.algorithm == BALANCE_LEAST_CONNECTIONS ?
-           "least-connections" : "round-robin");
+           "least-connections" : "round-robin", server.connect_timeout_ms,
+           server.idle_timeout_ms);
     fflush(stdout);
 
     struct epoll_event events[EVENT_BATCH];
     for (;;) {
-        int ready = epoll_wait(server.epoll_fd, events, EVENT_BATCH, -1);
+        uint64_t now;
+        if (!monotonic_ms(&now)) {
+            report_error("clock_gettime(CLOCK_MONOTONIC)");
+            break;
+        }
+        expire_connections(&server, now);
+        int wait_ms = epoll_deadline_wait_ms(&server, now);
+        int ready = epoll_wait(server.epoll_fd, events, EVENT_BATCH, wait_ms);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) { report_error("epoll_wait()"); break; }
         for (int i = 0; i < ready; ++i) {
@@ -1246,6 +1363,11 @@ parsed: ;
                 dispatch_client_event(&server, events[i].data.u64, events[i].events);
             }
         }
+        if (!monotonic_ms(&now)) {
+            report_error("clock_gettime(CLOCK_MONOTONIC)");
+            break;
+        }
+        expire_connections(&server, now);
     }
 
 done:

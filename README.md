@@ -1,3 +1,74 @@
+# Phase 26 - Backend Connection and Idle Timeouts
+
+Fedora Linux | C11 | nonblocking TCP | Linux `epoll` + `splice()` | apply **over Phase 25**.
+
+## What changed
+
+- Add `--connect-timeout-ms` (100..120000, default **5000**) and `--idle-timeout-ms` (100..3600000, default **60000**); both support `--name=N` and `--name N`. Defaults avoid disrupting earlier regression scenarios.
+- Store two monotonic timestamps per session: backend connect start and last successful byte movement. A pending TCP handshake is governed **only by its connection deadline**, so clients cannot extend it by sending preconnect bytes.
+- Refresh the ready-session idle clock on successful preconnect `recv()`, buffered `send()`, socket-to-pipe `splice()`, and pipe-to-socket `splice()`; `EPOLLIN`, `EPOLLOUT`, `EAGAIN`, and `EPOLLRDHUP` **are not activity** by themselves.
+- Pass the nearest deadline as the `epoll_wait()` timeout; when no clients are connected, keep `epoll_wait(..., -1)` to sleep until a real event. Use `CLOCK_MONOTONIC` so wall-clock adjustments cannot shift deadlines.
+- On connect timeout, mark the backend unhealthy with `ETIMEDOUT` and reuse Phase 19's cooldown/probe mechanism. On idle timeout, close only that connection. Both use centralized Phase 23/24 cleanup, preserving the listener and releasing active connection counters, sockets, pipes and epoll registrations.
+- Include an **integration-only** `LD_PRELOAD` shim (`tests/timeout_inject.c`) that suppresses one pending backend's `EPOLLOUT` readiness. A silent local backend then makes a real repeatable handshake-timeout test possible without internet routing assumptions. The shim is never part of the production executable.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase26_changes.zip
+unzip -o ~/Downloads/phase26_changes.zip -d .
+make clean
+make
+make test-timeouts
+make test
+```
+
+Expected focused ending: `PASS: Phase 26 backend connection and idle timeouts test suite`.
+Run `make test` for all prior phases; it builds both test-only shared libraries before running the tests. Large suites can take several minutes. Focused command tests: invalid CLI values, an idle connection closed after roughly 300 ms, ongoing traffic renewing its deadline, clean reconnection, a deliberately suppressed backend writable notification causing a 240 ms connect timeout, and re-probing that backend after 100 ms cooldown.
+
+## Manual test (three terminals)
+
+Terminal 1:
+
+```bash
+make backend-rr
+```
+
+Terminal 2:
+
+```bash
+./build/splice-lb --algorithm=least-connections \
+  --connect-timeout-ms 2500 --idle-timeout-ms 2000 \
+  9090 127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+Terminal 3:
+
+```bash
+./build/backend-client 127.0.0.1 9090 'hello phase 26'
+```
+
+Expected reply: `backend-0|hello phase 26`, or `backend-1|...` / `backend-2|...` depending on selection. The startup `Configuration` line prints both timeout values. The small example checks normal forwarding, **not** idle expiry; use `make test-timeouts` to see both timeout cases reliably.
+
+## Commands explained
+
+- `make clean`: delete the `build` directory (no source changes).
+- `make`: compile strict-warning C11 proxy and helper programs.
+- `make test-timeouts`: build the test-only shared object and execute deterministic integration cases.
+- `make test`: run the full phase-by-phase integration suite.
+- `ss -tan '( sport = :9090 or dport = :9090 )'`: list TCP sockets associated with the proxy port and their states.
+- `PID=$(pidof splice-lb)` followed by `ls -l /proc/$PID/fd`: inspect live process descriptors, including sockets, pipes, and the epoll instance.
+- `strace -f -e trace=epoll_wait,connect,getsockopt,shutdown,close ./build/splice-lb ...`: inspect timer wakeups and setup/teardown. `strace` affects timing; do not use it for performance measurements.
+- `date -Ins` reports wall clock time but **must not** drive timeout logic; `CLOCK_MONOTONIC` does.
+
+## Important limits and semantics
+
+A connect timeout measures the interval between initiating the backend connection and detecting completion, **not** the health of an already-connected backend. An idle timeout measures absence of *successful byte progress*, including activity in both directions; stalled transfers can expire on purpose. A successful TCP connection is not an application-level health check. The deadline scan is `O(active connections)` per loop iteration for clarity at this stage; later benchmarking must measure its cost at 1,000+ sessions. The test-only shim changes epoll registrations by `LD_PRELOAD`; never set `LD_PRELOAD` globally. Keep `phase26_learning_guide.pdf` outside this repository and out of Git.
+
+**Changed files:** `src/main.c`, `tests/timeout_inject.c`, `tests/test_timeouts.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 25 - Command-Line Configuration and Validation
 
 Fedora Linux | C11 | nonblocking TCP | `epoll` | `splice()` | apply on top of **Phase 24**.

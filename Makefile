@@ -8,6 +8,7 @@ CLIENT := build/backend-client
 ECHO := build/echo-backend
 SPLICE_DEMO := build/splice-demo
 SETUP_FAULTS := build/setup-faults.so
+TIMEOUT_INJECT := build/timeout-inject.so
 
 .PHONY: all clean test run
 all: $(SERVER) $(CLIENT) $(ECHO) $(SPLICE_DEMO)
@@ -41,6 +42,14 @@ test-config: all
 test-setup-failures: all $(SETUP_FAULTS)
 	python3 tests/test_setup_failures.py
 
+$(TIMEOUT_INJECT): tests/timeout_inject.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@
+
+.PHONY: test-timeouts
+test-timeouts: all $(TIMEOUT_INJECT)
+	python3 tests/test_timeouts.py
+
 # Terminal A: make backend (or ./build/echo-backend 9091)
 # Terminal B: make run
 .PHONY: backend
@@ -59,7 +68,7 @@ backend-rr:
 run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
-test: all $(SETUP_FAULTS)
+test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
@@ -84,6 +93,7 @@ test: all $(SETUP_FAULTS)
 	python3 tests/test_abrupt_disconnects.py
 	python3 tests/test_setup_failures.py
 	python3 tests/test_cli_config.py
+	python3 tests/test_timeouts.py
 
 clean:
 	rm -rf build

@@ -1,3 +1,19 @@
+# Phase 26 - Backend Connection and Idle Timeouts
+
+**Planned commit:** 2026-12-10 21:58:34 +05:30. **Status:** implemented and tested on Linux; verify on Fedora before committing.
+
+- [x] Parse and validate `--connect-timeout-ms` and `--idle-timeout-ms` with defaults 5000 and 60000 ms.
+- [x] Track monotonic handshake start separately from last successful byte progress.
+- [x] Compute nearest session deadline and feed it to epoll_wait without busy polling when idle.
+- [x] Retire stalled handshakes (backend cooldown) and idle sessions (connection-only cleanup).
+- [x] Preserve Phase 23/24 centralized resource teardown and fd-generation protection.
+- [x] Add test-only EPOLLOUT suppression to verify deterministic connection timeout.
+- [x] Test idle expiration, periodic traffic, successful recovery, strict CLI bounds.
+- [x] Pass Phase 2-26 tests in batches with strict C11 warnings; repeat `make test` on Fedora.
+- [x] Keep the in-depth learning PDF outside the source ZIP and Git repository.
+
+---
+
 # Phase 25 - Command-Line Configuration and Validation
 
 **Planned commit:** 2026-12-09 21:52:18 +05:30. **Status:** implemented and validated in Linux test environment; verify on Fedora before committing.
