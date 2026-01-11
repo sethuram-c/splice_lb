@@ -60,7 +60,7 @@ def main() -> None:
     try:
         baseline, epolls = wait_for_descriptor_count(proc.pid, 1)
         assert len(baseline) == 1
-        assert epoll_target_count(proc.pid, epolls[0]) == 1
+        assert epoll_target_count(proc.pid, epolls[0]) == 2
 
         # Hold two connections open at once. The proxy must not stop listening.
         with socket.create_connection(("127.0.0.1", port), TIMEOUT) as first, \
@@ -69,7 +69,7 @@ def main() -> None:
             second.settimeout(TIMEOUT)
             fds, epolls = wait_for_descriptor_count(proc.pid, 5)
             assert all_nonblocking(proc.pid, fds)
-            assert epoll_target_count(proc.pid, epolls[0]) == 5
+            assert epoll_target_count(proc.pid, epolls[0]) == 6
             first.sendall(b"first\x00connection")
             second.sendall(b"second\xffconnection")
             second.shutdown(socket.SHUT_WR)

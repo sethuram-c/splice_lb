@@ -85,7 +85,7 @@ def check_epoll_registration_and_socket_flags() -> None:
                         raise AssertionError(("epoll registration timeout", sockets, epolls))
                     time.sleep(0.01)
                 assert all_nonblocking(proc.pid, sockets), "not all proxy sockets are nonblocking"
-                assert epoll_target_count(proc.pid, epolls[0]) == 3, "expected listener+client+backend registered"
+                assert epoll_target_count(proc.pid, epolls[0]) == 4, "expected listener+signalfd+client+backend registered"
                 release_backend.set()
                 assert recv_until_eof(client) == b"ACK:" + payload
             wait_for_proxy_cleanup(proc)
@@ -103,7 +103,7 @@ def check_epoll_registration_and_socket_flags() -> None:
         assert not worker.is_alive(), "backend worker still running"
         if errors:
             raise errors[0]
-    print("PASS: epoll watches listener+client+backend; all sockets have O_NONBLOCK")
+    print("PASS: epoll watches listener+signalfd+client+backend; all sockets have O_NONBLOCK")
 
 
 def main() -> None:

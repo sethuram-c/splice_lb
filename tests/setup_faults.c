@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -54,7 +55,8 @@ int pipe2(int pipefd[2], int flags) {
 }
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
-    if (op == EPOLL_CTL_ADD) {
+    /* Phase 27: ignore the control-plane signalfd registration. */
+    if (op == EPOLL_CTL_ADD && event != NULL && event->data.u64 != UINT64_MAX) {
         ++adds_seen; /* first listener, second client, third backend */
         if (adds_seen == 2 && should_fail("epoll-client")) return -1;
         if (adds_seen == 3 && should_fail("epoll-backend")) return -1;

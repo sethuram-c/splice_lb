@@ -1,3 +1,17 @@
+# Phase 27 progress - Connection limits, logging, and graceful shutdown
+
+- [x] Accept `--max-connections 1..100000` and `--shutdown-grace-ms 100..120000` with strict parser and help.
+- [x] Reject excess TCP clients without selecting a backend, blocking the loop, or leaking descriptors.
+- [x] Record operational events and per-process accepted/rejected/closed/graceful counts.
+- [x] Capture SIGINT/SIGTERM using signalfd, prioritize shutdown readiness before accepts in a single epoll batch.
+- [x] Stop listener, drain established connections during the grace period; force centralized teardown at deadline.
+- [x] Preserve earlier test-harness signal exit status after safe cleanup, log completion before terminating.
+- [x] Update old epoll-count assertions and test-only fault injector to include control-plane signalfd.
+- [x] Add deterministic Phase 27 automated tests for limit, recovery, drain, force close, idle signal, and invalid flags.
+- [x] Store personal learning PDF separate from source repository.
+
+---
+
 # Phase 26 - Backend Connection and Idle Timeouts
 
 **Planned commit:** 2026-12-10 21:58:34 +05:30. **Status:** implemented and tested on Linux; verify on Fedora before committing.

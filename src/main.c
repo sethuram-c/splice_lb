@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <sys/signalfd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -28,6 +30,9 @@
 #define BACKEND_RETRY_DELAY_MS 3000ULL
 #define DEFAULT_CONNECT_TIMEOUT_MS 5000ULL
 #define DEFAULT_IDLE_TIMEOUT_MS 60000ULL
+#define DEFAULT_MAX_CONNECTIONS 10000U
+#define DEFAULT_SHUTDOWN_GRACE_MS 2000ULL
+#define SIGNAL_EVENT_TOKEN UINT64_MAX
 
 struct backend_target {
     struct sockaddr_in address;
@@ -168,6 +173,16 @@ struct server {
     uint64_t idle_timeout_ms;
     int listener;
     int epoll_fd;
+    int signal_fd;
+    unsigned max_connections;
+    uint64_t shutdown_grace_ms;
+    uint64_t shutdown_deadline_ms;
+    bool shutting_down;
+    int shutdown_signal;
+    uint64_t total_accepted;
+    uint64_t total_rejected;
+    uint64_t total_closed;
+    uint64_t total_graceful;
     struct backend_target backends[MAX_BACKENDS];
     size_t backend_count;
     size_t next_backend; /* next index for connection-level round robin */
@@ -177,6 +192,29 @@ struct server {
     uint32_t next_generation;
     size_t active;
 };
+
+/* Operational diagnostics are deliberately separate from the earlier phase's
+ * human-readable trace lines. Avoid adding log work to the SIGINT/SIGTERM
+ * handler: signalfd delivers both signals as normal epoll events. */
+static void operational_log(const char *level, const char *event,
+                            const char *format, ...) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    }
+    printf("LOG ts=%lld.%03ld level=%s event=%s", (long long)ts.tv_sec,
+           ts.tv_nsec / 1000000L, level, event);
+    if (format != NULL) {
+        putchar(' ');
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        va_end(args);
+    }
+    putchar('\n');
+    fflush(stdout);
+}
 
 static bool parse_port(const char *text, bool allow_zero, uint16_t *port) {
     if (text == NULL || *text == '\0') return false;
@@ -514,6 +552,8 @@ static void remove_connection(struct server *server, struct connection *connecti
     }
     --target->active_connections;
     --server->active;
+    ++server->total_closed;
+    if (reason == CLOSE_GRACEFUL) ++server->total_graceful;
     printf("Closed connection: client-to-backend=%" PRIu64 " bytes, "
            "backend-to-client=%" PRIu64 " bytes; active=%zu; "
            "client-to-pipe=%" PRIu64 " bytes; backend-to-pipe=%" PRIu64
@@ -896,6 +936,15 @@ static bool accept_ready(struct server *server) {
             report_error("accept()");
             return false;
         }
+        ++server->total_accepted;
+        if (server->active >= server->max_connections) {
+            ++server->total_rejected;
+            operational_log("WARN", "connection_rejected",
+                            "reason=connection_limit limit=%u connections=%zu rejected=%" PRIu64,
+                            server->max_connections, server->active, server->total_rejected);
+            if (close(client) < 0) report_error("close(rejected-client)");
+            continue;
+        }
         /* A backend refusal is isolated to this client; the listener remains alive. */
         (void)attach_connection(server, client);
     }
@@ -1141,12 +1190,57 @@ static void expire_connections(struct server *server, uint64_t now) {
     }
 }
 
+/* signalfd avoids async-signal-unsafe signal handlers and wakes epoll_wait
+ * even when there are no TCP clients. Stop accepting before draining existing
+ * connections. A second signal requests immediate (still centralized) cleanup. */
+static void begin_shutdown(struct server *server, int signal_number, uint64_t now) {
+    if (server->shutting_down) {
+        server->shutdown_deadline_ms = now;
+        operational_log("WARN", "shutdown_urgent", "signal=%d", signal_number);
+        return;
+    }
+    server->shutting_down = true;
+    server->shutdown_signal = signal_number;
+    server->shutdown_deadline_ms = now + server->shutdown_grace_ms;
+    if (server->listener >= 0) {
+        if (epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, server->listener, NULL) < 0)
+            report_error("epoll_ctl(DEL listener)");
+        if (close(server->listener) < 0) report_error("close(listener)");
+        server->listener = -1;
+    }
+    operational_log("INFO", "shutdown_started", "signal=%d connections=%zu grace_ms=%" PRIu64,
+                    signal_number, server->active, server->shutdown_grace_ms);
+}
+
+static bool consume_shutdown_signals(struct server *server) {
+    for (;;) {
+        struct signalfd_siginfo info;
+        ssize_t n = read(server->signal_fd, &info, sizeof(info));
+        if (n == -1 && errno == EINTR) continue;
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        if (n != (ssize_t)sizeof(info)) {
+            report_error("read(signalfd)");
+            return false;
+        }
+        uint64_t now;
+        if (!monotonic_ms(&now)) return false;
+        if (info.ssi_signo == SIGINT || info.ssi_signo == SIGTERM)
+            begin_shutdown(server, (int)info.ssi_signo, now);
+    }
+}
+
 static void cleanup_server(struct server *server) {
     while (server->connections != NULL)
         remove_connection(server, server->connections, CLOSE_SERVER_SHUTDOWN);
     if (server->listener >= 0) close(server->listener);
+    if (server->signal_fd >= 0) close(server->signal_fd);
     if (server->epoll_fd >= 0) close(server->epoll_fd);
     free(server->by_fd);
+    operational_log("INFO", "server_stopped",
+                    "accepted=%" PRIu64 " rejected=%" PRIu64
+                    " closed=%" PRIu64 " graceful=%" PRIu64 " connections=%zu",
+                    server->total_accepted, server->total_rejected,
+                    server->total_closed, server->total_graceful, server->active);
 }
 
 int main(int argc, char **argv) {
@@ -1157,16 +1251,19 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     uint16_t listen_port;
-    struct server server = {.listener = -1, .epoll_fd = -1};
+    struct server server = {.listener = -1, .epoll_fd = -1, .signal_fd = -1};
     server.listen_address.s_addr = htonl(INADDR_LOOPBACK);
     server.listen_backlog = LISTEN_BACKLOG;
     server.backend_retry_delay_ms = BACKEND_RETRY_DELAY_MS;
     server.connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS;
     server.idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
+    server.max_connections = DEFAULT_MAX_CONNECTIONS;
+    server.shutdown_grace_ms = DEFAULT_SHUTDOWN_GRACE_MS;
     int arg = 1;
     bool seen_algorithm = false, seen_listen_ip = false;
     bool seen_backlog = false, seen_retry_ms = false;
     bool seen_connect_timeout = false, seen_idle_timeout = false;
+    bool seen_max_connections = false, seen_shutdown_grace = false;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         printf("Usage: %s [OPTIONS] <listen-port> <IPv4:port> [IPv4:port ...]\n"
                "       %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
@@ -1177,6 +1274,8 @@ int main(int argc, char **argv) {
                "  --backend-retry-ms N      failed-backend cooldown, 100..60000 (default 3000)\n"
                "  --connect-timeout-ms N   backend handshake timeout, 100..120000 (default 5000)\n"
                "  --idle-timeout-ms N      no byte progress timeout, 100..3600000 (default 60000)\n"
+               "  --max-connections N       active connection cap, 1..100000 (default 10000)\n"
+               "  --shutdown-grace-ms N     SIGINT/SIGTERM drain window, 100..120000 (default 2000)\n"
                "  --help                    show this help; standalone only\n"
                "Each option also supports --name=value; up to %u backends.\n"
                "Listen port 0 requests an ephemeral port; backend port 0 is invalid.\n"
@@ -1237,6 +1336,20 @@ int main(int argc, char **argv) {
                                                            &number)) goto usage;
             seen_idle_timeout = true;
             server.idle_timeout_ms = (uint64_t)number;
+        } else if (key_len == strlen("--max-connections") &&
+                   strncmp(option, "--max-connections", key_len) == 0) {
+            unsigned number;
+            if (seen_max_connections || !parse_bounded_uint(value, 1U, 100000U,
+                                                              &number)) goto usage;
+            seen_max_connections = true;
+            server.max_connections = number;
+        } else if (key_len == strlen("--shutdown-grace-ms") &&
+                   strncmp(option, "--shutdown-grace-ms", key_len) == 0) {
+            unsigned number;
+            if (seen_shutdown_grace || !parse_bounded_uint(value, 100U, 120000U,
+                                                            &number)) goto usage;
+            seen_shutdown_grace = true;
+            server.shutdown_grace_ms = number;
         } else goto usage;
         ++arg;
     }
@@ -1285,7 +1398,9 @@ usage:
                     "[--listen-ip IPv4] [--backlog 1..4096] "
                     "[--backend-retry-ms 100..60000] "
                     "[--connect-timeout-ms 100..120000] "
-                    "[--idle-timeout-ms 100..3600000] <listen-port: 0-65535> "
+                    "[--idle-timeout-ms 100..3600000] "
+                    "[--max-connections 1..100000] "
+                    "[--shutdown-grace-ms 100..120000] <listen-port: 0-65535> "
                     "<IPv4:port> [IPv4:port ...] (max %u)\n"
                     "   legacy: %s [OPTIONS] <listen-port> <backend-IPv4> <backend-port>\n"
                     "   options may use --name=value; use --help for details\n",
@@ -1318,6 +1433,21 @@ parsed: ;
     struct epoll_event listener_event = {.events = EPOLLIN, .data.u64 = 0};
     if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, server.listener,
                   &listener_event) < 0) { report_error("epoll_ctl(listener)"); goto done; }
+    /* SIGPIPE stays ignored. SIGINT/SIGTERM are synchronously consumed from
+     * signalfd: no asynchronous access to connection memory or stdio. */
+    sigset_t shutdown_mask;
+    if (sigemptyset(&shutdown_mask) != 0 ||
+        sigaddset(&shutdown_mask, SIGINT) != 0 ||
+        sigaddset(&shutdown_mask, SIGTERM) != 0 ||
+        sigprocmask(SIG_BLOCK, &shutdown_mask, NULL) != 0) {
+        report_error("sigprocmask(shutdown)");
+        goto done;
+    }
+    server.signal_fd = signalfd(-1, &shutdown_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (server.signal_fd < 0) { report_error("signalfd()"); goto done; }
+    struct epoll_event signal_event = {.events = EPOLLIN, .data.u64 = SIGNAL_EVENT_TOKEN};
+    if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, server.signal_fd,
+                  &signal_event) < 0) { report_error("epoll_ctl(signalfd)"); goto done; }
     char listen_ip[INET_ADDRSTRLEN];
     if (inet_ntop(AF_INET, &server.listen_address, listen_ip,
                   sizeof(listen_ip)) == NULL) {
@@ -1337,12 +1467,15 @@ parsed: ;
     }
     printf("Configuration listen-ip=%s; backlog=%d; backend-retry-ms=%" PRIu64
            "; algorithm=%s; connect-timeout-ms=%" PRIu64
-           "; idle-timeout-ms=%" PRIu64 "\n", listen_ip, server.listen_backlog,
+           "; idle-timeout-ms=%" PRIu64 "; max-connections=%u"
+           "; shutdown-grace-ms=%" PRIu64 "\n", listen_ip, server.listen_backlog,
            server.backend_retry_delay_ms,
            server.algorithm == BALANCE_LEAST_CONNECTIONS ?
            "least-connections" : "round-robin", server.connect_timeout_ms,
-           server.idle_timeout_ms);
+           server.idle_timeout_ms, server.max_connections, server.shutdown_grace_ms);
     fflush(stdout);
+    operational_log("INFO", "server_ready", "limit=%u shutdown_grace_ms=%" PRIu64,
+                    server.max_connections, server.shutdown_grace_ms);
 
     struct epoll_event events[EVENT_BATCH];
     for (;;) {
@@ -1352,13 +1485,36 @@ parsed: ;
             break;
         }
         expire_connections(&server, now);
+        if (server.shutting_down && server.active == 0) {
+            operational_log("INFO", "shutdown_drained", "connections=0");
+            result = EXIT_SUCCESS;
+            break;
+        }
+        if (server.shutting_down && now >= server.shutdown_deadline_ms) {
+            operational_log("WARN", "shutdown_forced", "connections=%zu", server.active);
+            result = EXIT_SUCCESS;
+            break;
+        }
         int wait_ms = epoll_deadline_wait_ms(&server, now);
+        if (server.shutting_down) {
+            uint64_t remaining = server.shutdown_deadline_ms - now;
+            int grace_wait = remaining > INT_MAX ? INT_MAX : (int)remaining;
+            if (wait_ms < 0 || grace_wait < wait_ms) wait_ms = grace_wait;
+        }
         int ready = epoll_wait(server.epoll_fd, events, EVENT_BATCH, wait_ms);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) { report_error("epoll_wait()"); break; }
+        /* Process signals first even when the same batch includes accept
+         * readiness. Once shutdown begins, no new client can enter. */
         for (int i = 0; i < ready; ++i) {
+            if (events[i].data.u64 == SIGNAL_EVENT_TOKEN &&
+                !consume_shutdown_signals(&server)) goto done;
+        }
+        for (int i = 0; i < ready; ++i) {
+            if (events[i].data.u64 == SIGNAL_EVENT_TOKEN) continue;
             if (events[i].data.u64 == 0) {
-                if ((events[i].events & EPOLLERR) || !accept_ready(&server)) goto done;
+                if (!server.shutting_down &&
+                    ((events[i].events & EPOLLERR) || !accept_ready(&server))) goto done;
             } else {
                 dispatch_client_event(&server, events[i].data.u64, events[i].events);
             }
@@ -1372,5 +1528,15 @@ parsed: ;
 
 done:
     cleanup_server(&server);
+    if (server.shutdown_signal != 0 && result == EXIT_SUCCESS) {
+        /* Preserve the POSIX signal exit convention (SIGTERM=-15, SIGINT=-2)
+         * expected by earlier test harnesses. Cleanup already finished. */
+        signal(server.shutdown_signal, SIG_DFL);
+        sigset_t unmask;
+        sigemptyset(&unmask);
+        sigaddset(&unmask, server.shutdown_signal);
+        sigprocmask(SIG_UNBLOCK, &unmask, NULL);
+        raise(server.shutdown_signal);
+    }
     return result;
 }

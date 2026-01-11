@@ -1,3 +1,78 @@
+# Phase 27 - Connection Limits, Operational Logs, and Graceful Shutdown
+
+Fedora Linux | C11 | `epoll` + `splice()` | **apply on top of Phase 26**.
+
+## Changes
+
+- Introduce `--max-connections` (1..100000, default **10000**), a cap on **published active connections** (connecting and established). Extra accepted TCP sockets are closed immediately. A completed/failed connection frees its slot through the existing centralized cleanup path.
+- Introduce `--shutdown-grace-ms` (100..120000, default **2000**). On SIGINT or SIGTERM, stop accepting new clients and keep forwarding existing sessions until both TCP directions finish or the grace deadline expires. At expiry, close remaining connections using centralized cleanup, without replaying any data.
+- Receive SIGINT/SIGTERM through Linux `signalfd` registered in `epoll` (not an asynchronous signal handler). Events from signalfd are handled before other readiness events in the same batch. A **second** shutdown signal expires the grace interval immediately.
+- Emit timestamped `LOG ts=<epoch.seconds> level=INFO|WARN event=...` records for startup, connection-limit rejection, and shutdown stages/summary. Preserve the earlier detailed per-connection selection/close lines: duplicating them would add avoidable stdout blocking under heavy tests.
+- Track totals accepted, rejected, closed and graceful. Counts describe this proxy process only, not persistent monitoring/metrics.
+- Retain signal-derived process exit statuses after cleanup (`SIGTERM` -> subprocess `-15`, `SIGINT` -> `-2`) for compatibility with earlier phase tests. Resource release and shutdown logging occur **before** the conventional signal termination status is restored.
+- Test the cap, capacity recovery, delayed in-flight response, force close after grace, idle SIGINT and invalid CLI options. The Phase 24 test-only `epoll_ctl` injector now ignores the `signalfd` control registration. Prior `epoll` tests count the control registration explicitly.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase27_changes.zip
+unzip -o ~/Downloads/phase27_changes.zip -d .
+make clean
+make
+make test-operations
+make test
+```
+
+Expected focused ending: `PASS: Phase 27 connection limits, logging, and graceful shutdown test suite`.
+Run the full suite as a separate regression pass. Keep `phase27_learning_guide.pdf` outside Git.
+
+## Manual demonstration (three terminals)
+
+Terminal 1:
+
+```bash
+make backend-rr
+```
+
+Terminal 2:
+
+```bash
+./build/splice-lb --algorithm=least-connections \
+  --max-connections=2 --shutdown-grace-ms=2000 \
+  9090 127.0.0.1:9091 127.0.0.1:9092 127.0.0.1:9093
+```
+
+Terminal 3:
+
+```bash
+./build/backend-client 127.0.0.1 9090 'hello phase 27'
+```
+
+Expected response starts `backend-0|`, `backend-1|`, or `backend-2|`. Stop Terminal 2 with **Ctrl+C**; it should log `event=shutdown_started` and a `event=shutdown_drained` (or `shutdown_forced`) record, then `event=server_stopped`.
+
+For the connection cap, start three **held-open** TCP sockets and inspect logs. A one-shot client is too short-lived to demonstrate the limit reliably; use `make test-operations` for the deterministic scenario.
+
+## Commands and troubleshooting
+
+- `make clean`: delete compiled build products only.
+- `make test-operations`: run the four operational behavior scenarios plus CLI validation.
+- `make test`: run all regression and integration tests, including Phase 24/26 test-only fault injectors.
+- `ss -ltn '( sport = :9090 )'`: confirm listening socket; should disappear after shutdown begins.
+- `PID=$(pidof splice-lb); ls -l /proc/$PID/fd`: view the server's open sockets, pipes, epoll fd and signalfd.
+- `cat /proc/$PID/fdinfo/FD`: inspect epoll watched descriptors (`FD` is the epoll file descriptor).
+- `strace -e trace=signalfd4,rt_sigprocmask,epoll_wait,close -f ./build/splice-lb ...`: inspect signal/event and teardown syscalls, not throughput.
+- `kill -TERM "$PID"`: request graceful shutdown; `kill -INT "$PID"` is equivalent to Ctrl+C.
+- `ulimit -n`: display shell's open file descriptor ceiling; it may limit practical capacity below the configured cap.
+
+### Important design boundaries
+
+This cap limits active **sessions**, not the number of file descriptors (each session requires two sockets plus four pipe endpoints), nor memory committed by the kernel TCP stacks. The default limit **does not establish** that 10,000 connections have been measured; Phase 30 will stress-test capacity. On a forced shutdown, pending data can be discarded. To protect service continuity across restarts, an external supervisor and coordinated restart strategy would be needed; Phase 27 implements per-process graceful draining only.
+
+**Changed files:** `src/main.c`, `tests/setup_faults.c`, `tests/test_epoll.py`, `tests/test_multiclient.py`, `tests/test_bidirectional_buffers.py`, `tests/test_operational_controls.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 26 - Backend Connection and Idle Timeouts
 
 Fedora Linux | C11 | nonblocking TCP | Linux `epoll` + `splice()` | apply **over Phase 25**.

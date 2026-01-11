@@ -24,7 +24,7 @@ def watch_masks(pid: int) -> list[int]:
                                                 info, re.MULTILINE)]
 
 
-def wait_for_masks(pid: int, expected: int = 3) -> list[int]:
+def wait_for_masks(pid: int, expected: int = 4) -> list[int]:
     end = time.monotonic() + TIMEOUT
     while time.monotonic() < end:
         masks = watch_masks(pid)
@@ -68,7 +68,7 @@ def check_idle_no_epollout() -> None:
             stop_proxy(proc)
 
     run_backend(backend, action)
-    print('PASS: 3 epoll watches; no EPOLLOUT subscription on idle connections')
+    print('PASS: 4 epoll watches; no EPOLLOUT subscription on idle connections')
 
 
 def check_slow_client() -> None:

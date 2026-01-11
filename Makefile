@@ -94,6 +94,11 @@ test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_setup_failures.py
 	python3 tests/test_cli_config.py
 	python3 tests/test_timeouts.py
+	python3 tests/test_operational_controls.py
+
+.PHONY: test-operations
+test-operations: all
+	python3 tests/test_operational_controls.py
 
 clean:
 	rm -rf build
