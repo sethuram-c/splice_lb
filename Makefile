@@ -69,6 +69,8 @@ run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
 test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
+	python3 tests/test_harness.py
+	python3 tests/test_basic_payloads.py
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
@@ -99,6 +101,11 @@ test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 .PHONY: test-operations
 test-operations: all
 	python3 tests/test_operational_controls.py
+
+.PHONY: test-basic
+test-basic: all
+	python3 tests/test_harness.py
+	python3 tests/test_basic_payloads.py
 
 clean:
 	rm -rf build

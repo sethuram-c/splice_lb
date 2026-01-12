@@ -1,3 +1,23 @@
+# Phase 28 - Test Harness and Basic Payload Tests
+
+**Scheduled commit:** 2026-12-12 21:38:26 +05:30. **Environment:** Fedora Linux; C11/GCC; Python 3 standard library.
+
+- [x] Add reusable loopback backend and proxy subprocess context managers.
+- [x] Use kernel-assigned ephemeral ports instead of hard-coded test ports.
+- [x] Avoid stdout pipe deadlock by logging proxy output to a temporary regular file.
+- [x] Guarantee proxy shutdown/reap and backend shutdown/join during test cleanup.
+- [x] Provide deterministic byte generation, fragmented duplex exchange, exact comparison and SHA-256 diagnostics.
+- [x] Prove the oracle rejects intentionally truncated and modified response data.
+- [x] Verify 16 sequential payload patterns and 12 concurrent byte-exact clients.
+- [x] Add `make test-basic` and register both new suites in `make test`.
+- [x] Keep personal learning PDF separate from Git and the source ZIP.
+- [x] Focused Phase 28 self-tests and payload matrix passed in the Linux test environment.
+- [x] Full Phase 2-28 regression suite passed on a fresh Phase 27-to-28 merged tree; 12-client barrier test passed in a separate focused run.
+- [x] Earlier Phase 22 timing-sensitive cleanup failure passed in latest full run; continue monitoring for flakiness.
+- [ ] Rerun `make test-basic && make test` on Fedora before the scheduled commit.
+
+---
+
 # Phase 27 progress - Connection limits, logging, and graceful shutdown
 
 - [x] Accept `--max-connections 1..100000` and `--shutdown-grace-ms 100..120000` with strict parser and help.

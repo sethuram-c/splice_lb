@@ -1,3 +1,72 @@
+# Phase 28 - Reusable Test Harness and Basic TCP Payload Tests
+
+Fedora Linux | Python 3 standard library | `epoll` + `splice()` proxy | **apply on top of Phase 27**.
+
+## What is new
+
+- `tests/harness.py`: reusable context-manager fixtures for a loopback TCP echo backend and for the proxy process. Both request kernel-assigned ports so tests can run alongside other services.
+- The proxy's stdout/stderr is captured to a *temporary regular file*, not an undrained pipe. This avoids filling a subprocess pipe and stalling the proxy during verbose/concurrent tests.
+- Test resources are cleaned up automatically: the backend server is shut down and joined, and the proxy receives SIGTERM, then SIGKILL as a bounded fallback if necessary.
+- Add `deterministic_bytes()` for reproducible binary payloads, `assert_bytes_equal()` with first mismatched offset and SHA-256 diagnostics, and a full-duplex `request()` helper with fragmented sends and concurrent receives.
+- `tests/test_harness.py`: negative controls deliberately truncate/modify payloads and confirm the comparison helper *rejects* them; verifies fixture startup and teardown.
+- `tests/test_basic_payloads.py`: 16 payload cases including empty, single-byte, UTF-8, embedded NUL/0xff, 8 KiB and 64 KiB boundary cases, and a >256 KiB transfer. Adds 12 overlapping clients with exact byte checks.
+- Existing C forwarding and load-balancing implementation is unchanged; this phase improves verification infrastructure, not claimed throughput.
+
+## Fedora verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -o ~/Downloads/phase28_changes.zip -d .
+make clean
+make
+make test-basic   # new self-test and basic payload integration suite
+make test         # entire regression suite, including Phase 28
+```
+
+Expected focused ending:
+
+```text
+PASS: Phase 28 reusable harness self-test suite
+PASS: 16 payload cases, 492080 bytes, including empty, UTF-8, binary and buffer boundaries
+PASS: 12 simultaneous-client workloads, 239538 byte-exact bytes
+PASS: Phase 28 basic payload test suite
+```
+
+To run the Python tests individually:
+
+```bash
+python3 tests/test_harness.py
+python3 tests/test_basic_payloads.py
+```
+
+Verification in the Linux execution environment: `make clean`, `make`, focused Phase 28 tests, and a complete `make test` run passed on the Phase 27-to-28 merged tree. The revised 12-client barrier-based case also passed individually. A Phase 22 cleanup-timing assertion had failed intermittently in an earlier run, but passed in the latest full run. Repeat the complete suite on Fedora and investigate any recurrence.
+
+The tests are self-contained: each starts its own temporary backend and proxy. Do not start `make backend-rr` or `make run` for these two tests. They use only Python's standard library and ordinary user permissions.
+
+## How the new harness works
+
+1. `echo_backend()` starts an echo server listening on `127.0.0.1:0` in a background thread, yields the allocated port, then shuts down and joins the thread.
+2. `proxy_session(backend_port)` starts `build/splice-lb 0 127.0.0.1:PORT`, polls its startup log with `time.monotonic()` for a bounded time, and yields the actual listening port.
+3. `request(port, payload, fragment_sizes=...)` opens TCP, writes pieces on a worker thread, calls `shutdown(SHUT_WR)` after the final byte, and concurrently reads the reply until EOF.
+4. `assert_bytes_equal()` compares *all bytes* and on failure reports the first different offset plus both lengths and SHA-256 hashes. The negative control verifies the assertion would actually detect corrupted data.
+
+The 12-client parallel test verifies correctness, **not** the resume claim of supporting thousands of concurrent clients. That load target is reserved for Phase 30. Likewise, SHA-256 here helps diagnose corruption but exact byte equality is the primary correctness oracle.
+
+## Debugging and tests
+
+- `make clean`: removes `build/`; no source files are touched.
+- `make`: compiles the C binaries with strict warnings.
+- `make test-basic`: runs Phase 28 focused verification only.
+- `make test`: runs all previous phase regressions plus the two new suites.
+- `python3 tests/test_basic_payloads.py`: reruns the basic payload matrix alone.
+- `ss -ltn '( sport = :9090 )'`: shows a manually started listener on port 9090; Phase 28's auto-assigned port is different and appears only while the test runs.
+- `strace -f -e trace=socket,connect,accept4,splice ./build/splice-lb 9090 127.0.0.1 9091`: inspects network/splice syscalls during a manually started backend+proxy demo.
+- If a test fails, read the assertion's label, first mismatch offset, expected/actual lengths, and digests. Do not presume that differences in TCP `recv()` chunk sizes indicate corruption.
+
+The personal `phase28_learning_guide.pdf` is not part of the ZIP or Git repository.
+
+---
+
 # Phase 27 - Connection Limits, Operational Logs, and Graceful Shutdown
 
 Fedora Linux | C11 | `epoll` + `splice()` | **apply on top of Phase 26**.
