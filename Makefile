@@ -71,6 +71,7 @@ run: $(SERVER)
 test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_harness.py
 	python3 tests/test_basic_payloads.py
+	python3 tests/test_large_transfers.py
 	python3 tests/test_listener.py
 	python3 tests/test_echo.py
 	python3 tests/test_proxy.py
@@ -109,3 +110,7 @@ test-basic: all
 
 clean:
 	rm -rf build
+
+.PHONY: test-large
+test-large: all
+	python3 tests/test_large_transfers.py

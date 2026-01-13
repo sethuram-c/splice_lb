@@ -1,6 +1,6 @@
 # Phase 28 - Test Harness and Basic Payload Tests
 
-**Scheduled commit:** 2026-12-12 21:38:26 +05:30. **Environment:** Fedora Linux; C11/GCC; Python 3 standard library.
+**Scheduled commit:** 2026-12-12 21:44:19 +05:30. **Environment:** Fedora Linux; C11/GCC; Python 3 standard library.
 
 - [x] Add reusable loopback backend and proxy subprocess context managers.
 - [x] Use kernel-assigned ephemeral ports instead of hard-coded test ports.
@@ -12,8 +12,8 @@
 - [x] Add `make test-basic` and register both new suites in `make test`.
 - [x] Keep personal learning PDF separate from Git and the source ZIP.
 - [x] Focused Phase 28 self-tests and payload matrix passed in the Linux test environment.
-- [x] Full Phase 2-28 regression suite passed on a fresh Phase 27-to-28 merged tree; 12-client barrier test passed in a separate focused run.
-- [x] Earlier Phase 22 timing-sensitive cleanup failure passed in latest full run; continue monitoring for flakiness.
+- [x] Phase 2-21 regression run passed; Phase 22 had a cleanup-timing failure on one run and passed on a later individual rerun.
+- [x] Phase 23-27 regression suites passed separately. Full uninterrupted run remains unverified.
 - [ ] Rerun `make test-basic && make test` on Fedora before the scheduled commit.
 
 ---
@@ -299,3 +299,15 @@
   - [x] Verify exactly one injected failure per proxy process, restored fd baseline and byte-exact recovery on the next client
   - [x] Pass all Phase 2-24 regressions in two test batches under strict C compiler flags
   - [x] Deliver personal learning PDF outside source ZIP and Git repository
+
+- [x] Phase 28 - Reusable Python test harness and basic payload cases
+  - [x] Deterministic binary correctness oracle, process cleanup, and concurrent requests
+  - [x] Keep production C unchanged
+
+- [x] Phase 29 - Large transfers and byte integrity
+  - [x] Add streaming echo fixture to avoid holding whole payloads in memory
+  - [x] Add 16 MiB + 17 B fragmented and 32 MiB + 1 B large duplex cases
+  - [x] Test four simultaneous 8 MiB+ connections with byte-count and SHA-256 validation
+  - [x] Check proxy fd baseline after completed sessions
+  - [x] Add make test-large and integrate with make test
+  - [x] Keep learning PDF outside Git repository

@@ -39,7 +39,7 @@ python3 tests/test_harness.py
 python3 tests/test_basic_payloads.py
 ```
 
-Verification in the Linux execution environment: `make clean`, `make`, focused Phase 28 tests, and a complete `make test` run passed on the Phase 27-to-28 merged tree. The revised 12-client barrier-based case also passed individually. A Phase 22 cleanup-timing assertion had failed intermittently in an earlier run, but passed in the latest full run. Repeat the complete suite on Fedora and investigate any recurrence.
+Verification in the Linux execution environment: the focused Phase 28 tests passed, the previous Phase 2-21 tests passed in the full run, and Phases 23-27 passed individually. A Phase 22 cleanup-timing assertion failed once in the full run, failed on its first isolated retry, and passed on a later isolated retry. Repeat the uninterrupted suite on Fedora and investigate any recurrence.
 
 The tests are self-contained: each starts its own temporary backend and proxy. Do not start `make backend-rr` or `make run` for these two tests. They use only Python's standard library and ordinary user permissions.
 
@@ -1504,3 +1504,35 @@ consume kernel resources: thousands of sessions must be verified later
 against memory and `ulimit -n` rather than assumed to scale. Pipe-to-socket
 forwarding, `EAGAIN` recovery, and pipe occupancy tracking follow in Phases
 11-14. The learning guide PDF is personal study material, not a repo file.
+
+
+## Phase 29 - Large transfers and byte integrity
+
+Phase 29 adds multi-megabyte streamed correctness tests **without changing**
+`src/main.c`. Run on Fedora after applying the Phase 29 changed-files ZIP:
+
+```bash
+make clean
+make
+make test-large
+make test
+```
+
+`make test-large` starts an on-demand bounded-memory streaming echo backend
+and the real C proxy on automatically selected loopback ports. It verifies:
+
+- A fragmented **16 MiB + 17 B** duplex transfer, including 1 B writes.
+- A **32 MiB + 1 B** duplex transfer across repeated socket operations.
+- **Four concurrent** connections carrying 8 MiB or more each.
+- Independent SHA-256 of all written and returned bytes plus exact byte counts.
+- No file-descriptor growth after all sessions complete.
+
+The backend echoes as bytes arrive, rather than accumulating 32 MiB in
+Python memory. The client computes SHA-256 incrementally and sends while
+receiving to avoid test-induced full-duplex deadlocks. The random payload
+generator uses fixed seeds for repeatability; it is not a security PRNG.
+Elapsed test time is diagnostic, **not a valid performance benchmark**:
+Phase 34 measures sustained throughput, CPU, and latency under controlled
+conditions. Phase 30 tests 1,000-10,000 concurrent connections.
+
+The personal learning PDF must be kept outside the repository and ZIP.

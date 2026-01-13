@@ -59,6 +59,33 @@ def echo_backend() -> Iterator[int]:
             raise AssertionError('backend thread did not stop')
 
 
+class _StreamingEchoHandler(socketserver.BaseRequestHandler):
+    """Echo bytes as they arrive, without retaining the complete request."""
+    def handle(self) -> None:
+        self.request.settimeout(90)
+        while True:
+            block = self.request.recv(65536)
+            if not block:
+                break
+            self.request.sendall(block)
+
+
+@contextmanager
+def streaming_echo_backend() -> Iterator[int]:
+    """A bounded-memory echo fixture for multi-megabyte duplex tests."""
+    server = _EchoServer((HOST, 0), _StreamingEchoHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        if thread.is_alive():
+            raise AssertionError('streaming backend thread did not stop')
+
+
 @dataclass
 class ProxySession:
     proc: subprocess.Popen
