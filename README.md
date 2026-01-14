@@ -1536,3 +1536,65 @@ Phase 34 measures sustained throughput, CPU, and latency under controlled
 conditions. Phase 30 tests 1,000-10,000 concurrent connections.
 
 The personal learning PDF must be kept outside the repository and ZIP.
+
+## Phase 30 - 1,000 to 10,000 concurrent TCP connections
+
+Phase 30 adds a **test-only** selector/epoll echo backend (`tests/scalable_backend.py`)
+and a scale certification harness (`tests/test_concurrency_scale.py`). The
+production C proxy is **not changed**. Each client completes a byte-exact echo
+probe then remains connected while the other clients are established. When all
+N are simultaneously active, the harness sends further probes to four sample
+clients, checks the backend's live-connection count, tests a connection above
+the `--max-connections` cap, then closes everyone and verifies descriptor cleanup.
+
+On Fedora, start with:
+
+```bash
+make clean && make
+make test-scale                      # 1,000 live connections
+make test-scale-5k                   # optional: 5,000, requires higher fd limits
+make test-scale-10k                  # optional: 10,000, requires higher fd limits
+# or choose an exact target and write JSON outside the repository:
+python3 tests/test_concurrency_scale.py --connections 1000 \
+  --timeout 300 --report /tmp/phase30-1k.json
+cat /tmp/phase30-1k.json
+```
+
+`make test` includes a low-resource 100-client smoke run. `make test-scale`
+performs the measured 1,000-client certification separately; 5,000 and 10,000
+are **not silently counted as passed** and must be run explicitly on your Fedora
+machine. The harness fails fast if the inherited `RLIMIT_NOFILE` soft limit is
+less than approximately `6*N + 96`: the proxy uses two TCP sockets and two
+pairs of pipe descriptors per active connection. The test driver and backend
+need approximately N descriptors each, in their respective processes. Check:
+
+```bash
+ulimit -Sn; ulimit -Hn
+cat /proc/sys/fs/file-max
+cat /proc/sys/net/ipv4/ip_local_port_range
+cat /proc/sys/net/core/somaxconn
+```
+
+In a shell with a sufficient hard limit, `ulimit -Sn 65535` permits a nominal
+10,000-session proxy test (10,000 * 6 plus overhead). If the hard limit is
+smaller, configure the user/session limits appropriately; do not silently
+lower the test's requested target. Higher scales can also require significant
+memory and CPU time. The test-only backend uses one selector thread instead of
+one operating-system thread per client. The Python fixture writes proxy logs to
+a regular file to avoid blocking the proxy on an undrained stdout pipe.
+
+**Actual observed result in the build/test environment** (not Fedora):
+
+```text
+PASS: 1000 simultaneously live client/backend sessions; 1004 byte-exact probes
+PASS: connection cap rejected overflow; fds returned to 6
+OBSERVED: establish=0.58s, proxy RSS=12.5 MiB, proxy fds=6006, CPU=0.36s
+PASS: Phase 30 high-concurrency test suite
+```
+
+These measurements are environment-specific, not end-to-end throughput or
+p99-latency benchmarks. Do not claim 5k or 10k sessions until the corresponding
+Fedora run passes. The current timeout-deadline sweep is O(active sessions) per
+event-loop iteration, so Phase 34 should investigate scalability before
+making any low-latency claim. Save JSON reports under `/tmp` or another
+location outside Git, and keep the accompanying learning PDF outside the repo.

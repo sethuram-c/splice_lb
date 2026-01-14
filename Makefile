@@ -69,6 +69,7 @@ run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
 test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
+	python3 tests/test_concurrency_scale.py --connections 100
 	python3 tests/test_harness.py
 	python3 tests/test_basic_payloads.py
 	python3 tests/test_large_transfers.py
@@ -114,3 +115,14 @@ clean:
 .PHONY: test-large
 test-large: all
 	python3 tests/test_large_transfers.py
+
+# Default scale certification target. 5k/10k are explicit opt-in runs.
+.PHONY: test-scale test-scale-5k test-scale-10k
+test-scale: all
+	python3 tests/test_concurrency_scale.py --connections 1000 --report /tmp/phase30-1k.json
+
+test-scale-5k: all
+	python3 tests/test_concurrency_scale.py --connections 5000 --report /tmp/phase30-5k.json
+
+test-scale-10k: all
+	python3 tests/test_concurrency_scale.py --connections 10000 --report /tmp/phase30-10k.json

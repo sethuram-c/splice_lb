@@ -311,3 +311,14 @@
   - [x] Check proxy fd baseline after completed sessions
   - [x] Add make test-large and integrate with make test
   - [x] Keep learning PDF outside Git repository
+
+- [x] Phase 30 - High-concurrency capacity and resource tests
+  - [x] Add selector-based echo backend without one OS thread per connection
+  - [x] Validate N simultaneously live TCP sessions, payload integrity and held-open probes
+  - [x] Verify max-connections rejection and subsequent fd cleanup
+  - [x] Collect observed proxy fd count, RSS, CPU time and connection setup timing
+  - [x] Add 100-client smoke run to make test and explicit 1k/5k/10k make targets
+  - [x] Verify 1,000 live connections on the available Linux execution environment
+  - [ ] Verify 5,000 live connections on Fedora with sufficient fd and memory limits
+  - [ ] Verify 10,000 live connections on Fedora with sufficient fd and memory limits
+  - [x] Keep personal PDF study guide and JSON measurements outside the repository
