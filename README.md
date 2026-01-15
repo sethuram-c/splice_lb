@@ -1,3 +1,77 @@
+# Phase 31 - Round Robin and Least Connections Stress Tests
+
+**Fedora Linux | Python 3 | C11 proxy, epoll and splice() | apply over Phase 30**
+
+## What's new
+
+- `tests/test_algorithm_stress.py` compares the real TCP load balancer's Round Robin and Least Connections strategies under **the same uneven connection-lifetime schedule**. No production C code is modified.
+- Starts three tagged echo backends, uses one fresh proxy process per algorithm, verifies exact binary echoes, then leaves TCP sessions open so they count as active.
+- Establishes 24 initial sessions, selectively completes 6/6/6/12 sessions on chosen backends, adds four sequential arrival waves (18/18/18/24), and finishes with **30 concurrent arrivals**.
+- Tests **132 actual connections per algorithm** (264 total), reaching **102 simultaneously held-open TCP sessions** for each algorithm. Confirms all 132 sessions complete without missing data and all backend-active slots return to zero.
+- Computes `active_spread = max(active connections) - min(active connections)` at each checkpoint. In the controlled workload, Least Connections has a lower spread at four uneven-lifetime checkpoints. This is **not** a proof of better throughput, lower latency, or universal algorithm superiority.
+- Adds `make test-algorithm-stress` and includes the new check in the regular `make test` suite. Optional JSON/CSV outputs are written to paths you choose; keep reports outside your Git repository.
+
+## Fedora installation and verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -l ~/Downloads/phase31_changes.zip
+unzip -o ~/Downloads/phase31_changes.zip -d .
+make clean
+make
+make test-algorithm-stress
+make test
+```
+
+Expected focused ending:
+
+```text
+PASS: round-robin: 132 byte-exact sessions, 102 held at peak, all slots released
+PASS: least-connections: 132 byte-exact sessions, 102 held at peak, all slots released
+PASS: Least Connections has smaller active-load spread than Round Robin at four unequal-lifetime checkpoints
+PASS: Phase 31 Round Robin and Least Connections stress test suite
+```
+
+To save measurements **outside the repository**:
+
+```bash
+python3 tests/test_algorithm_stress.py \
+  --json /tmp/phase31-distribution.json \
+  --csv /tmp/phase31-distribution.csv
+column -s, -t /tmp/phase31-distribution.csv | head -15
+python3 -m json.tool /tmp/phase31-distribution.json | head -60
+```
+
+The test chooses loopback ports automatically. Do **not** run a separate `make backend-rr` or `make run` during automated verification. If the test fails, the process is stopped and backend listener sockets are released.
+
+## Measured scenario from the Linux test environment
+
+| Checkpoint | Round Robin active backend counts | Least Connections counts | Spread RR / LC |
+|---|---|---|---|
+| 24-connection baseline | 8 / 8 / 8 | 8 / 8 / 8 | 0 / 0 |
+| backend 2 loses six sessions, add 18 | 14 / 14 / 8 | 12 / 12 / 12 | 6 / 0 |
+| backend 1 loses six sessions, add 18 | 20 / 14 / 14 | 16 / 16 / 16 | 6 / 0 |
+| backend 0 loses six sessions, add 18 | 20 / 20 / 20 | 20 / 20 / 20 | 0 / 0 |
+| backend 2 loses 12 sessions, add 24 | 28 / 28 / 16 | 24 / 24 / 24 | 12 / 0 |
+| 30 concurrent incoming connections | 38 / 38 / 26 | 34 / 34 / 34 | 12 / 0 |
+
+**Interpretation:** connection-level Least Connections responds to *current live connections*, whereas Round Robin rotates over arrival count irrespective of lifetime. Active connection count is an imperfect proxy for work: a single bandwidth-heavy stream may use more resources than many idle streams. Phase 34 handles controlled latency/throughput benchmarking.
+
+## Commands and diagnostics
+
+- `make clean`: deletes generated binaries in `build/`.
+- `make`: strict-warning compile of C proxy and helper programs.
+- `make test-algorithm-stress`: launches the standalone real-TCP stress comparison.
+- `make test`: runs Phase 31 plus all previous regression tests; the complete run can take several minutes.
+- `ss -tan '( sport = :9090 or dport = :9090 )'`: inspect manual TCP connections (automated tests use ephemeral ports).
+- `ls /proc/$(pidof splice-lb)/fd | wc -l`: count live proxy descriptors for a manually started proxy.
+- `strace -f -e trace=connect,epoll_wait,splice ./build/splice-lb ...`: inspect syscalls when debugging; **do not** use `strace` for throughput measurements.
+- The JSON/CSV reports are **test artifacts**, not production server metrics.
+
+**Changed files:** `tests/test_algorithm_stress.py`, `Makefile`, `README.md`, `progress.md`. Keep `phase31_learning_guide.pdf` outside the repository and out of Git.
+
+---
+
 # Phase 28 - Reusable Test Harness and Basic TCP Payload Tests
 
 Fedora Linux | Python 3 standard library | `epoll` + `splice()` proxy | **apply on top of Phase 27**.

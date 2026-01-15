@@ -1,3 +1,22 @@
+# Phase 31 - Algorithm Distribution Stress Tests
+
+**Scheduled commit:** 2026-12-15 21:48:27 +05:30. **Environment:** Fedora Linux / C11 / Python 3.
+
+- [x] Use the production proxy unchanged; add a Python integration stress test.
+- [x] Run Round Robin and Least Connections in separate, fresh proxy processes against three real tagged TCP servers.
+- [x] Hold sessions open across a controlled sequence of uneven session closures and subsequent arrivals.
+- [x] Verify binary echo correctness for 132 connections per algorithm.
+- [x] Exercise a simultaneous wave of 30 incoming TCP connections; peak 102 held-open connections per algorithm.
+- [x] Confirm exact backend counts at six checkpoints and all 132 active slots released per algorithm.
+- [x] Demonstrate smaller active-connection spread for Least Connections at four skewed checkpoints.
+- [x] Add optional JSON and CSV exports outside the repository.
+- [x] Add `make test-algorithm-stress` and integrate with `make test`.
+- [x] Run focused Phase 31 test repeatedly; pass old Phase 16/17/18 algorithm tests.
+- [ ] Run entire `make test` suite on Fedora after extracting Phase 31 ZIP and verify there are no local timing-sensitive regressions.
+- [x] Prepare a separate personal PDF guide that is not committed to Git.
+
+---
+
 # Phase 28 - Test Harness and Basic Payload Tests
 
 **Scheduled commit:** 2026-12-12 21:44:19 +05:30. **Environment:** Fedora Linux; C11/GCC; Python 3 standard library.
