@@ -69,6 +69,7 @@ run: $(SERVER)
 	./$(SERVER) 9090 127.0.0.1 9091
 
 test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
+	python3 tests/test_adversarial_peers.py
 	python3 tests/test_algorithm_stress.py
 	python3 tests/test_concurrency_scale.py --connections 100
 	python3 tests/test_harness.py
@@ -132,3 +133,8 @@ test-scale-10k: all
 .PHONY: test-algorithm-stress
 test-algorithm-stress: all
 	python3 tests/test_algorithm_stress.py
+
+# Phase 32: mixed slow peers, half-closes, resets, and backend recovery.
+.PHONY: test-adversarial
+test-adversarial: all
+	python3 tests/test_adversarial_peers.py

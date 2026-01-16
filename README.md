@@ -1672,3 +1672,51 @@ Fedora run passes. The current timeout-deadline sweep is O(active sessions) per
 event-loop iteration, so Phase 34 should investigate scalability before
 making any low-latency claim. Save JSON reports under `/tmp` or another
 location outside Git, and keep the accompanying learning PDF outside the repo.
+
+## Phase 32 - Adversarial TCP behavior: slow peers, FIN, resets and recovery
+
+Phase 32 adds an **integration-test-only** adversarial suite. No production C
+code is modified. Run this phase on Fedora after applying the changed-files
+ZIP over Phase 31:
+
+```bash
+make clean
+make
+make test-adversarial      # dedicated mixed-failure test (~seconds)
+make test                  # all previous test suites plus Phase 32
+```
+
+The new `tests/test_adversarial_peers.py` uses loopback ports selected by the
+OS and always reaps spawned processes. It verifies three separate workloads:
+
+1. **Simultaneous slow peers and resets:** six concurrent 1 MiB+ streamed
+   requests to a throttled backend, with delayed client reads and twelve
+   intentionally reset TCP sockets. After those sessions, an additional
+   byte-exact request succeeds and `/proc/<pid>/fd` returns to its baseline.
+2. **Backend FIN before client upload:** four parallel sessions receive a
+   backend response and FIN *before* uploading between zero and 1 MiB+ bytes.
+   The backend independently hashes every late upload and confirms its SHA-256.
+3. **Backend loss and recovery:** a refused backend enters cooldown; five
+   concurrent requests reach the healthy backend and preserve their bytes.
+   When the failed address begins accepting again, the load balancer probes
+   and restores it to the selectable pool.
+
+The suite checks actual response bytes and end-state cleanup. It does not
+prove freedom from every possible race, nor does a locally induced pause
+reproduce arbitrary Internet conditions. For syscall inspection:
+
+```bash
+strace -f -e trace=splice,epoll_wait,epoll_ctl,shutdown,getsockopt \
+  ./build/splice-lb 9090 127.0.0.1 9091
+```
+
+For resource inspection in a separate terminal:
+
+```bash
+PID=$(pidof splice-lb)
+ls /proc/$PID/fd | wc -l
+ss -tan '( sport = :9090 )'
+```
+
+Keep generated logs, metrics and the personal Phase 32 learning PDF outside
+Git; only the five changed source/project files belong in the commit.

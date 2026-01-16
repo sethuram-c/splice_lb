@@ -341,3 +341,14 @@
   - [ ] Verify 5,000 live connections on Fedora with sufficient fd and memory limits
   - [ ] Verify 10,000 live connections on Fedora with sufficient fd and memory limits
   - [x] Keep personal PDF study guide and JSON measurements outside the repository
+
+- [x] Phase 32 - Slow peers, half-closes, and failures
+  - [x] Add mixed adversarial integration tests without changing production C
+  - [x] Run six concurrent throttled full-duplex streams with exact binary comparison
+  - [x] Trigger twelve real client RSTs and ensure a fresh healthy request succeeds
+  - [x] Verify baseline file descriptor count after adverse workload cleanup
+  - [x] Verify four backend-FIN-first sessions accept later client uploads, checked by SHA-256
+  - [x] Quarantine an unavailable backend while five concurrent healthy requests succeed
+  - [x] Verify recovered backend rejoins the pool after cooldown
+  - [x] Add make test-adversarial and keep it in the default make test target
+  - [x] Keep the in-depth personal learning PDF outside the repository
