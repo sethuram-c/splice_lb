@@ -63,11 +63,16 @@ class _StreamingEchoHandler(socketserver.BaseRequestHandler):
     """Echo bytes as they arrive, without retaining the complete request."""
     def handle(self) -> None:
         self.request.settimeout(90)
-        while True:
-            block = self.request.recv(65536)
-            if not block:
-                break
-            self.request.sendall(block)
+        try:
+            while True:
+                block = self.request.recv(65536)
+                if not block:
+                    break
+                self.request.sendall(block)
+        except (ConnectionResetError, BrokenPipeError):
+            # Fault tests deliberately reset TCP clients; this is expected
+            # network behavior, not a backend fixture failure.
+            pass
 
 
 @contextmanager

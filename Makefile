@@ -70,6 +70,7 @@ run: $(SERVER)
 
 test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_adversarial_peers.py
+	python3 tests/test_fd_leaks.py
 	python3 tests/test_algorithm_stress.py
 	python3 tests/test_concurrency_scale.py --connections 100
 	python3 tests/test_harness.py
@@ -138,3 +139,29 @@ test-algorithm-stress: all
 .PHONY: test-adversarial
 test-adversarial: all
 	python3 tests/test_adversarial_peers.py
+
+# Phase 33: instrumented binaries are separate from the production build.
+# Using a non-PIE sanitizer binary avoids ASan shadow/PIE mapping collisions
+# observed on some Linux/container ASLR configurations.
+SANITIZER_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror \
+                   -fno-omit-frame-pointer -fno-pie -fsanitize=address,undefined
+SANITIZER_LDFLAGS := -no-pie -fsanitize=address,undefined
+SANITIZED_SERVER := build/sanitize/splice-lb
+SANITIZED_DEMO := build/sanitize/splice-demo
+
+$(SANITIZED_SERVER): src/main.c
+	@mkdir -p build/sanitize
+	$(CC) $(CPPFLAGS) $(SANITIZER_FLAGS) -DSANITIZER_TEST_EXIT $< -o $@ $(SANITIZER_LDFLAGS)
+
+$(SANITIZED_DEMO): src/splice_demo.c
+	@mkdir -p build/sanitize
+	$(CC) $(CPPFLAGS) $(SANITIZER_FLAGS) $< -o $@ $(SANITIZER_LDFLAGS)
+
+.PHONY: sanitize-build test-sanitizers test-fd-leaks
+sanitize-build: $(SANITIZED_SERVER) $(SANITIZED_DEMO)
+
+test-sanitizers: sanitize-build
+	python3 tests/test_sanitizers.py
+
+test-fd-leaks: all
+	python3 tests/test_fd_leaks.py

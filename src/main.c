@@ -1529,6 +1529,12 @@ parsed: ;
 done:
     cleanup_server(&server);
     if (server.shutdown_signal != 0 && result == EXIT_SUCCESS) {
+#if defined(SANITIZER_TEST_EXIT)
+        /* Sanitizer-only binary: return through libc so LeakSanitizer's
+         * atexit hooks run after the normal epoll/socket/pipe cleanup.
+         * Production builds retain the original signal exit convention. */
+        return EXIT_SUCCESS;
+#else
         /* Preserve the POSIX signal exit convention (SIGTERM=-15, SIGINT=-2)
          * expected by earlier test harnesses. Cleanup already finished. */
         signal(server.shutdown_signal, SIG_DFL);
@@ -1537,6 +1543,7 @@ done:
         sigaddset(&unmask, server.shutdown_signal);
         sigprocmask(SIG_UNBLOCK, &unmask, NULL);
         raise(server.shutdown_signal);
+#endif
     }
     return result;
 }

@@ -1,3 +1,21 @@
+# Phase 33 - Sanitizer Checks and Resource Leak Detection
+
+**Scheduled commit:** 2026-12-17 21:47:26 +05:30.  **Target:** Fedora Linux, GCC.
+
+- [x] Preserve original optimized production build and exit status.
+- [x] Build separately ASan/UBSan instrumented proxy and splice demo.
+- [x] Enable normal sanitized shutdown exit to allow LeakSanitizer's exit hooks.
+- [x] Exercise 16 concurrent byte-exact TCP sessions and 12 deliberate resets in sanitizer build.
+- [x] Detect sanitizer runtime warnings and require clean process exit after drain.
+- [x] Verify file descriptor counts (total/socket/pipe) return to baseline after 72 normal sessions and 36 TCP resets.
+- [x] Keep backend test fixture quiet on intentionally reset TCP sockets.
+- [x] Strict GCC build and Phase 33 targeted checks passed in Linux execution environment.
+- [x] Earlier Phase 2-32 regressions passed when grouped into batches; full combined `make test` exceeded this tool's execution timeout before Phase 8.
+- [ ] Re-run a complete uninterrupted `make test` and both Phase 33 targets on Fedora.
+- [x] Keep personal PDF out of Git and source ZIP.
+
+---
+
 # Phase 31 - Algorithm Distribution Stress Tests
 
 **Scheduled commit:** 2026-12-15 21:48:27 +05:30. **Environment:** Fedora Linux / C11 / Python 3.

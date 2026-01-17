@@ -1,3 +1,98 @@
+# Phase 33 - Sanitizer Checks and Resource Leak Detection
+
+**Fedora Linux | C11/GCC | Linux epoll/splice | apply over Phase 32**
+
+## Changes
+
+- `src/main.c`: a compile-time **test-only** `SANITIZER_TEST_EXIT` branch lets the
+  instrumented proxy exit normally *after* full shutdown cleanup so
+  LeakSanitizer can run its process-exit hooks. The production binary retains
+  the original SIGINT/SIGTERM exit status and behavior.
+- `Makefile`: `sanitize-build`, `test-sanitizers` and `test-fd-leaks`. The
+  instrumented executables are isolated under `build/sanitize/` and never
+  replace `build/splice-lb`.
+- `tests/test_sanitizers.py`: ASan/UBSan-instrumented `splice` demo and a real
+  TCP proxy test (16 concurrent binary sessions, 12 resets, recovery, clean
+  SIGTERM drain, LeakSanitizer check on normal return).
+- `tests/test_fd_leaks.py`: 72 successful sessions plus 36 intentional TCP
+  resets; compare `/proc/<pid>/fd` totals/socket/pipe counts after each wave,
+  and verify another request succeeds.
+- `tests/harness.py`: treats expected `ConnectionResetError`/`BrokenPipeError`
+  from deliberately reset test clients as normal fixture termination.
+- The regular `make test` includes the lightweight descriptor-lifetime test.
+  Sanitizers remain an explicit opt-in because they slow execution and require
+  compiler runtime libraries.
+
+## Fedora setup and verification
+
+```bash
+cd /path/to/splice-load-balancer
+unzip -o ~/Downloads/phase33_changes.zip -d .
+make clean
+make
+make test-fd-leaks
+make sanitize-build
+make test-sanitizers
+make test
+```
+
+If packages are missing, on Fedora use `sudo dnf install gcc make python3`
+(and `sudo dnf install valgrind` optionally). `make test-sanitizers` uses GCC's
+`-fsanitize=address,undefined` and tests the *sanitized build*, not the regular
+production executable. It turns on LeakSanitizer via `ASAN_OPTIONS`.
+
+Expected focused endings:
+
+```
+PASS: Phase 33 /proc file descriptor lifetime suite
+PASS: sanitizer-instrumented splice demo 512 KiB+, byte exact
+PASS: 16 concurrent ASan/UBSan TCP forwarding sessions, byte exact
+PASS: 12 reset clients; sanitized proxy remains operational
+PASS: sanitizer proxy returned cleanly; ASan/UBSan/LSan reported no errors
+PASS: Phase 33 ASan/UBSan/LeakSanitizer suite
+```
+
+The C proxy still requires Linux. Tests create loopback TCP endpoints and
+require no root privileges. Tests write temporary files under `/tmp` and
+remove them. Keep the PDF **outside the repository**.
+
+## Interpreting the result
+
+- **ASan** catches many out-of-bounds and use-after-free errors along exercised
+  code paths. **UBSan** checks certain undefined C operations. **LSan** checks
+  reachable allocation leaks at normal program exit. Zero reports do not prove
+  absence of memory bugs or data races.
+- Sanitized builds in this phase use `-fno-pie`/`-no-pie` to avoid shadow-memory
+  mapping collisions observed in some ASan Linux/container environments. This
+  is **test-only**: the regular production build is unchanged.
+- LeakSanitizer does **not** check file-descriptor ownership. `/proc/<pid>/fd`
+  snapshot checks test descriptor counts after connections drain. Stable counts
+  are valuable evidence but cannot prove there are no short-lived or offsetting
+  leaks. The 64 KiB application/pipe queue budget is not the same as memory
+  held in TCP kernel socket buffers.
+- Phase 33 is **correctness and resource safety**, not a throughput benchmark.
+  Never compare sanitized speed with the optimized production binary.
+
+## Troubleshooting
+
+```bash
+ulimit -n
+ls -l /proc/$(pidof splice-lb)/fd
+ss -tan '( sport = :9090 )'
+ASAN_OPTIONS=help=1 ./build/sanitize/splice-lb --help
+```
+
+ASan/UBSan failures cause nonzero test status and show diagnostics in the
+report. If `make test` hits the surrounding execution time limit, run its
+individual Python suites or rerun on Fedora. Do not claim an uninterrupted
+suite pass unless it completed.
+
+**Commit date:** 2026-12-17 21:47:26 +05:30.
+**Changed files:** `src/main.c`, `tests/harness.py`, `tests/test_sanitizers.py`,
+`tests/test_fd_leaks.py`, `Makefile`, `README.md`, `progress.md`.
+
+---
+
 # Phase 31 - Round Robin and Least Connections Stress Tests
 
 **Fedora Linux | Python 3 | C11 proxy, epoll and splice() | apply over Phase 30**
