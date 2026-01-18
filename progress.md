@@ -370,3 +370,15 @@
   - [x] Verify recovered backend rejoins the pool after cooldown
   - [x] Add make test-adversarial and keep it in the default make test target
   - [x] Keep the in-depth personal learning PDF outside the repository
+
+
+- [x] Phase 34 - Throughput and latency benchmarking
+  - [x] Add benchmark-only pthread/blocking-select TCP relay reference
+  - [x] Use the same local selector-based backend for both implementations
+  - [x] Measure byte-exact streaming goodput and persistent ping-pong latency
+  - [x] Report p50/p95/p99, request rate, CPU seconds, VmHWM and environment
+  - [x] Add quick smoke test with no arbitrary performance pass/fail gates
+  - [x] Run 1/8/32-client local repetitions and distinguish illustrative figures
+  - [ ] Rerun under controlled conditions on target Fedora host; archive JSON in /tmp
+  - [ ] Confirm high concurrency 5k/10k independently; Phase 30 remains open
+  - [x] Keep personal benchmarking PDF outside the repository

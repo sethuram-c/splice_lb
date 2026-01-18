@@ -102,6 +102,7 @@ test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_cli_config.py
 	python3 tests/test_timeouts.py
 	python3 tests/test_operational_controls.py
+	python3 tests/test_benchmark.py
 
 .PHONY: test-operations
 test-operations: all
@@ -165,3 +166,24 @@ test-sanitizers: sanitize-build
 
 test-fd-leaks: all
 	python3 tests/test_fd_leaks.py
+
+# Phase 34 - comparison-only blocking thread-per-connection reference.
+# It is intentionally not linked into the production splice-lb executable.
+BLOCKING_BASELINE := build/blocking-baseline
+$(BLOCKING_BASELINE): benchmarks/blocking_baseline.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread $< -o $@ $(LDFLAGS) -pthread $(LDLIBS)
+
+.PHONY: test-benchmark benchmark benchmark-quick
+# Small deterministic functional smoke. Timing numbers are not pass/fail criteria.
+test-benchmark: all $(BLOCKING_BASELINE)
+	python3 tests/test_benchmark.py
+
+benchmark-quick: all $(BLOCKING_BASELINE)
+	python3 benchmarks/bench_forwarding.py --quick --output /tmp/phase34-quick.json
+
+benchmark: all $(BLOCKING_BASELINE)
+	python3 benchmarks/bench_forwarding.py --output /tmp/phase34-benchmark.json
+
+# Integrate Phase 34 smoke test into the full regression suite.
+test: $(BLOCKING_BASELINE)

@@ -1815,3 +1815,52 @@ ss -tan '( sport = :9090 )'
 
 Keep generated logs, metrics and the personal Phase 32 learning PDF outside
 Git; only the five changed source/project files belong in the commit.
+
+
+## Phase 34 - Reproducible throughput and latency benchmarking
+
+**What this tests:** localhost end-to-end traffic through either the production
+Linux `epoll`/`splice()` proxy or a **benchmark-only** blocking TCP proxy
+(`benchmarks/blocking_baseline.c`). The baseline uses one pthread per client
+and blocking `select` + `recv`/`send`; it is not part of the production build.
+Both targets connect to the same selector-based Python echo backend.
+
+**Fedora setup / verification:**
+
+```sh
+make clean
+make
+make test-benchmark  # smoke: 1 and 4 clients, both implementations
+make test            # full regression suite; also runs benchmark smoke
+make benchmark-quick # quick JSON: /tmp/phase34-quick.json
+make benchmark       # 1, 8, 32 clients; 3 repetitions; JSON at /tmp/phase34-benchmark.json
+```
+
+Custom reproducible workloads (reports stay outside the repository):
+
+```sh
+python3 benchmarks/bench_forwarding.py \
+  --clients 1,8,32 --requests 50 --payload-kib 1024 \
+  --repetitions 5 --output /tmp/splice-benchmark.json
+python3 -m json.tool /tmp/splice-benchmark.json | less
+```
+
+**Metrics:** RTT p50/p95/p99 for 64-byte echo exchanges; request rate;
+aggregate application-layer **one-direction echoed goodput** in MiB/s for
+byte-exact streaming uploads; per-process CPU seconds used in each workload;
+`VmHWM` (peak observed high-water RSS) from `/proc`; OS/kernel and file limit
+metadata. The tool checks every response's exact bytes / SHA-256.
+
+**Interpretation:** No latency or throughput threshold is used as a test pass
+condition. The Python clients, Python backend, localhost TCP, kernel scheduler,
+and machine load all contribute to measured results. The baseline is not a
+perfectly matched implementation; do not advertise its numbers as proof of
+`splice()` speedup or extrapolate to a production NIC. Rerun on your Fedora
+machine after keeping the governor, CPU load, payload, sample count, and
+concurrency constant. A result for 32 clients does not certify 10,000 clients.
+The test does not measure accept-to-connect latency, packet latency, or
+maximum link capacity. Save and publish the Fedora environment and repeated
+results before making resume performance claims.
+
+Learning-only PDF: `phase34_learning_guide.pdf` is distributed separately;
+**do not add it or benchmark JSON output to the repository.**
