@@ -382,3 +382,13 @@
   - [ ] Rerun under controlled conditions on target Fedora host; archive JSON in /tmp
   - [ ] Confirm high concurrency 5k/10k independently; Phase 30 remains open
   - [x] Keep personal benchmarking PDF outside the repository
+
+- [x] Phase 35 - Final documentation, reproducible demo and release checks
+  - [x] Add a self-contained tagged-backend demo for Round Robin and Least Connections
+  - [x] Verify binary payload integrity and graceful shutdown in both demo scenarios
+  - [x] Add independent release demo smoke tests and JSON report schema checks
+  - [x] Write concise main README and move phase history to docs/PHASE_HISTORY.md
+  - [x] Document architecture, algorithm tradeoffs, benchmark evidence and limitations
+  - [x] Add make demo / make test-release / make verify-release targets
+  - [ ] Complete target-Fedora end-to-end and 5,000/10,000 connection certification
+  - [ ] Add license before open-source publication

@@ -103,6 +103,7 @@ test: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
 	python3 tests/test_timeouts.py
 	python3 tests/test_operational_controls.py
 	python3 tests/test_benchmark.py
+	python3 tests/test_release_demo.py
 
 .PHONY: test-operations
 test-operations: all
@@ -187,3 +188,20 @@ benchmark: all $(BLOCKING_BASELINE)
 
 # Integrate Phase 34 smoke test into the full regression suite.
 test: $(BLOCKING_BASELINE)
+
+# Phase 35: deterministic, self-contained final demonstration. No root or
+# external network connection required. JSON reports belong under /tmp.
+.PHONY: demo test-release verify-release
+
+demo: all
+	python3 demo/final_demo.py --algorithm both --report /tmp/phase35-demo.json
+
+test-release: all
+	python3 tests/test_release_demo.py
+
+# Full release gate; can be long and should be run locally on Fedora.
+verify-release: all $(SETUP_FAULTS) $(TIMEOUT_INJECT)
+	$(MAKE) test-release
+	$(MAKE) test
+	$(MAKE) test-sanitizers
+	$(MAKE) test-benchmark
