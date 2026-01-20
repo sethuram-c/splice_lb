@@ -1,24 +1,31 @@
-# Splice TCP Load Balancer
+# splice_lb
 
-A Linux IPv4 TCP load balancer written in C, built around **nonblocking sockets**, **`epoll`**, and bidirectional **`splice()`** forwarding through per-connection kernel pipes. Routes TCP connections using **Round Robin** or **Least Connections**.
+A TCP load balancer for Linux, written in C. It accepts client connections with
+`epoll`, connects to a selected backend without blocking the event loop, and
+forwards data in both directions with `splice()` and a pair of pipes per
+connection.
 
-> **Status:** Phase 35 release candidate. Local Linux tests have verified **1,000 simultaneously open connections**, but the intended **5,000/10,000** test targets are **not yet verified** on the target Fedora workstation. Benchmark results are localhost measurements, not universal performance claims.
+I started with a blocking TCP relay and worked toward an event-driven version.
+The main things I wanted to get right were partial transfers, backpressure,
+half-closed sockets, and cleaning up after failed connections.
 
-## Quick start (Fedora)
+## Build and try it
+
+On Fedora:
 
 ```bash
 sudo dnf install gcc make python3 git
 make clean && make
-make demo             # starts three loopback backends and runs both routing demos
-make test-release     # checks the demo, graceful shutdown and JSON report
+make demo
 ```
 
-No root permissions or external network access are required for the default demo. `make demo` creates `/tmp/phase35-demo.json`. Generated learning PDFs do **not** belong in this repository.
+`make demo` starts local backends, runs both routing policies, and writes a
+report to `/tmp/phase35-demo.json`. It doesn't need root access.
 
-### Manual TCP proxy demo (3 terminals)
+For a manual run, open three terminals:
 
 ```bash
-# Terminal 1: three tagged backends
+# Terminal 1: three backends that identify themselves in replies
 make backend-rr
 ```
 
@@ -29,62 +36,90 @@ make backend-rr
 ```
 
 ```bash
-# Terminal 3: repeat to observe cyclic backend labels
-./build/backend-client 127.0.0.1 9090 'hello splice'
+# Terminal 3: run this a few times
+./build/backend-client 127.0.0.1 9090 'hello'
 ```
 
-Run `./build/splice-lb --help` for the complete and validated CLI. `--algorithm=least-connections` selects the backend with the fewest active connections, including pending backend handshakes. The default bind address is loopback only. Only use `--listen-ip=0.0.0.0` after reviewing firewall and exposure implications.
+The backend prefix in the reply should rotate. To try the other policy, restart
+the proxy with `--algorithm=least-connections`. Its choice depends on how many
+sessions are still open, so the automated load-distribution test is a better
+example than one-off requests.
 
-## Architecture
+`./build/splice-lb --help` shows all CLI options. The listener binds to
+`127.0.0.1` by default; `--listen-ip=0.0.0.0` exposes it on other interfaces
+when the host firewall permits that.
 
+## How it works
+
+Each accepted connection has a client socket, an upstream socket, and two
+nonblocking pipes (one for each direction):
+
+```text
+client --splice--> pipe --splice--> backend
+client <--splice-- pipe <--splice-- backend
 ```
-client TCP socket       Linux pipe        backend TCP socket
-        |                 |                        |
-        +---- splice() -->+---- splice() --------->+ 
-        +<--- splice() ---+<--- splice() -----------+
-                      epoll readiness
+
+`epoll` drives socket readiness. Pending backend connections are checked with
+`SO_ERROR`. The proxy temporarily stages a small amount of client data before
+the upstream connection completes; that early path uses `recv()`/`send()`.
+Once connected, the main forwarding path uses `splice()`.
+
+When a destination is slow, the corresponding pipe fills and the proxy stops
+reading from that source until it can make progress. `EPOLLOUT` is requested
+only while a write is pending. EOF is tracked independently in both directions:
+one side can finish sending without losing a response from the other side.
+
+Backend selection supports Round Robin and Least Connections. Failed TCP
+handshakes put a backend on a short cooldown; subsequent traffic can probe it
+again. An existing TCP stream is not replayed on another backend, since doing
+so could duplicate an application request.
+
+More detail: [architecture](docs/ARCHITECTURE.md).
+
+## Tests
+
+```bash
+make test-release          # small end-to-end check
+make test-basic            # payload lengths, binary data, concurrent clients
+make test-large            # 16/32 MiB streaming transfers
+make test-algorithm-stress # uneven connection lifetimes
+make test-adversarial      # slow peers, FIN, RST, backend failure
+make test-fd-leaks         # /proc descriptor checks
+make test-sanitizers       # separate ASan/UBSan build
+make test-benchmark        # checks the benchmark tool
+make test-scale            # 1,000 simultaneous connections
+make test                 # full regression suite (takes longer)
 ```
 
-Every accepted TCP connection has two independent unidirectional forwarding states and nonblocking pipes. Preconnect payload staging can use ordinary userspace buffering; after backend establishment, forwarding uses `splice()` where applicable. `EPOLLOUT` is armed only with pending destination writes. Each direction handles partial transfers, backpressure and FIN independently.
+For the larger concurrency targets, use `make test-scale-5k` or
+`make test-scale-10k` after checking the file-descriptor limit. A proxied
+connection uses approximately six descriptors in the proxy alone, so the
+higher tests may require changes to `ulimit -n` and enough memory.
 
-More details: [architecture](docs/ARCHITECTURE.md), [testing and benchmarks](docs/VALIDATION.md), [release checklist](docs/RELEASE_CHECKLIST.md).
+## Results so far
 
-## Test commands
+- A 1,000-live-connection run passed in the original Linux test environment.
+  I still need to reproduce that result on the target Fedora machine.
+- Large binary transfers and deliberately slow peers passed integrity tests.
+- Least Connections reduced active-connection imbalance in tests with uneven
+  session lifetimes; this is not a claim that it has better throughput.
+- Localhost benchmarks against a simple blocking reference showed mixed
+  results. The methodology and numbers are in [validation](docs/VALIDATION.md).
 
-| Command | Purpose |
-|---|---|
-| `make test-release` | Fast end-to-end final demo and release smoke |
-| `make test-basic` | Binary payload boundary cases |
-| `make test-large` | 16/32 MiB transfers and exact integrity |
-| `make test-algorithm-stress` | Round Robin vs Least Connections with uneven lifetimes |
-| `make test-adversarial` | Slow peers, half-closes, resets, backend recovery |
-| `make test-fd-leaks` | Repeated connections, stable descriptor counts |
-| `make test-sanitizers` | AddressSanitizer + UBSan and leak checks |
-| `make test-benchmark` | Validated benchmark smoke; no arbitrary speed thresholds |
-| `make test-scale` | 1,000 live connections (resource limits apply) |
-| `make test-scale-5k` / `make test-scale-10k` | **Not yet certified** on Fedora; require substantial file descriptor limits |
-| `make test` | Entire regression suite; potentially lengthy |
-| `make verify-release` | Release demo, full suite, sanitizer, benchmark smoke |
+**The 5,000- and 10,000-connection targets are not verified.** A configured
+maximum of 10,000 is only a limit, not a measured capacity.
 
-Benchmark reports and per-host evidence should live under `/tmp` or a separate private notes folder. See [validation and performance evidence](docs/VALIDATION.md) for interpretation.
+## Boundaries
 
-## Design and limitations
+This is a TCP/IPv4 connection-level proxy. It does not parse HTTP, terminate
+TLS, support UDP or IPv6, or run active application-health probes. It doesn't
+attempt seamless failover for an already established stream. There are also
+places where the single-file event loop in `src/main.c` could use further
+refactoring.
 
-- **Linux-only**, IPv4 and TCP; no TLS termination, HTTP parsing, or UDP support.
-- Balances **connections**, not individual HTTP requests or bytes transferred. Least Connections does not measure CPU or per-backend processing cost.
-- Backend failure suppression is cooldown-based; recovering backends are probed by subsequent traffic, not a continuous external health agent.
-- Failed TCP sessions are **not replayed** to a different backend, to avoid duplicating application side effects.
-- A configurable **10,000-connection limit is not proof of 10,000 concurrent connections**. Test with suitable `ulimit -n`, memory and kernel limits before making that claim.
-- The provided reference baseline is a **blocking comparison implementation** for learning; performance results depend strongly on host and workload.
+Source is in `src/`, integration tests in `tests/`, benchmark tools in
+`benchmarks/`, and the demo in `demo/`. I kept the implementation history in
+[development notes](docs/PHASE_HISTORY.md). Known verification work is tracked
+in [progress.md](progress.md).
 
-## Repository map
-
-- `src/main.c`: production event loop, scheduling, forwarding and cleanup.
-- `src/backend_client.c`, `src/echo_backend.c`, `src/splice_demo.c`: learning and manual test helpers.
-- `demo/final_demo.py`: self-contained Round Robin + Least Connections demonstration.
-- `tests/`: correctness, concurrency, fault-injection, resource safety and release tests.
-- `benchmarks/`: blocking baseline plus repeatable benchmark runner.
-- `docs/`: architecture, validation and original phase-by-phase README history.
-- `progress.md`: 35-phase roadmap and remaining host-specific verification tasks.
-
-**Licensing:** no license is asserted by this release guide. Add an appropriate `LICENSE` file before advertising the repository as open source.
+No open-source license has been selected yet.

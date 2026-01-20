@@ -1,51 +1,32 @@
-# Final Release Checklist — Phase 35
+# Release checklist
 
-## Code and correctness
+A few checks I want completed on the Fedora machine before treating a tag as a
+verified release.
 
-- [x] `make clean && make` compiles the release candidate with strict warnings.
-- [x] `make test-release` checks tagged routing, binary integrity and graceful shutdown.
-- [x] `make demo` produces a JSON report outside the repository.
-- [ ] Run **uninterrupted** `make test` on the target Fedora host.
-- [ ] Run `make test-sanitizers` and `make test-fd-leaks` on Fedora.
-- [ ] Run `make test-benchmark` and a controlled `make benchmark` on Fedora.
-- [ ] Run 1,000 connections on Fedora; optionally test 5,000 and 10,000 with adequate limits.
+## Build and tests
 
-## Documentation and repository hygiene
+- [ ] `make clean && make` completes with `-Wall -Wextra -Wpedantic -Werror`.
+- [ ] `make test-release` and `make demo` pass.
+- [ ] `make test` finishes in one run; investigate any intermittent failures.
+- [ ] `make test-sanitizers` and `make test-fd-leaks` pass.
+- [ ] `make test-benchmark` passes; retain the output of `make benchmark`.
+- [ ] `make test-scale` passes on Fedora. Record system limits before trying 5k/10k.
+- [ ] Inspect `git diff --check` and `git status --short` before committing.
 
-- [x] Document architecture, limitations, verification commands and evidence.
-- [x] Preserve the full earlier README in `docs/PHASE_HISTORY.md`.
-- [x] Keep learning PDFs out of ZIP and source control.
-- [x] Use `.gitignore` for generated `build/` binaries, `*.pdf` and `*.zip`.
-- [ ] Review `git diff --check`, `git status --short` and exact staged files.
-- [ ] Add a license if publishing as open source; no license is inferred.
-- [ ] Publish repository only after checking for personal paths, secrets and artifacts.
+## Manual checks
 
-## Demo presentation (about 3–5 minutes; duration is an agenda, not work estimate)
+- [ ] Try both `--algorithm=round-robin` and `--algorithm=least-connections`.
+- [ ] Stop a backend and confirm the listener still accepts healthy clients.
+- [ ] Send Ctrl+C during a live connection and inspect graceful shutdown.
+- [ ] Review open descriptors with `/proc/<pid>/fd` after clients disconnect.
 
-1. Show `src/main.c` ownership of sockets, two pipes per connection and `epoll` readiness.
-2. Run `make demo`, show Round Robin selections and Least Connections held-open test.
-3. Explain that EOF in one direction does not end the other stream.
-4. Show `make test-release`, one sanitizer result and a high-concurrency JSON report.
-5. State the measured 1,000-session result and the unverified 5,000/10,000 targets without exaggeration.
-6. End with bottlenecks, architecture tradeoffs and next improvements.
+## Repo housekeeping
 
-## Git commit
+- [ ] Ensure `build/`, bytecode, benchmark JSON, and learning PDFs aren't staged.
+- [ ] Check documentation examples against `./build/splice-lb --help`.
+- [ ] Add a license if I decide to publish under an open-source license.
+- [ ] Review repository for machine-specific paths or anything private.
+- [ ] Tag only after the above checks are complete.
 
-Scheduled December 19, 2026 (India Standard Time). Commit only after verification:
-
-```bash
-git add \
-  Makefile \
-  README.md \
-  progress.md \
-  demo/final_demo.py \
-  tests/test_release_demo.py \
-  docs/ARCHITECTURE.md \
-  docs/VALIDATION.md \
-  docs/RELEASE_CHECKLIST.md \
-  docs/PHASE_HISTORY.md
-
-git diff --cached --check
-```
-
-The personal learning PDF is separate and should not be staged.
+Not currently implemented: TLS termination, HTTP parsing, IPv6, UDP, active
+backend health checks, or failover of an already-established TCP stream.

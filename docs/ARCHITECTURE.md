@@ -1,51 +1,93 @@
-# Architecture and Operating Invariants
+# Architecture notes
 
-## 1. Connection-level routing
+This is a single-process, single-event-loop TCP proxy. There is no worker pool
+and no application-level protocol inspection. Each incoming connection is
+assigned to one backend, and the proxy moves bytes until both TCP directions
+finish or an error closes the session.
 
-The process accepts on a nonblocking TCP listen socket and holds an `epoll` file descriptor containing registered client/backend endpoints and a Linux `signalfd`. Multiple backends are represented by IPv4 addresses, ports, selection counters, active-connection counts and a recovery timestamp.
+## Connection setup
 
-- **Round Robin** chooses the next selectable backend in a rotation. It does not react to connection lifetimes.
-- **Least Connections** chooses the fewest active connections, counting backend handshakes that have started. Rotating tie-breaking prevents perpetually preferring backend zero when equal.
-- A backend whose TCP connect failed enters a configured cooldown. A subsequent request may probe it after that delay. Application-level health is **not** checked.
-- Accepted connections cannot be transparently retried after arbitrary forwarding has started: TCP is an arbitrary byte stream and the application may have performed irreversible work.
+The listening socket and accepted client sockets are nonblocking. A new client
+gets a backend selected by Round Robin or Least Connections. The backend socket
+is also nonblocking: `connect()` can return `EINPROGRESS`, and a later writable
+notification prompts a `getsockopt(SO_ERROR)` check.
 
-## 2. Socket and direction lifecycle
+A connection is not exposed to the normal event handlers until its sockets,
+pipes, lookup entry, and `epoll` registrations are ready. Failures during setup
+unwind whatever has already been allocated. Each connection's event token
+includes a generation, so an old event cannot be mistaken for a new connection
+that happened to reuse the same file descriptor.
 
-Each proxy connection owns:
+The implementation is mostly in `src/main.c`. That's convenient for following
+the event loop, but it is large and would benefit from separating socket
+lifecycle, forwarding, and backend policy into modules.
 
-- a client socket and an outbound backend socket (initially `CONNECTING`, then `READY`);
-- two independent `direction` objects with separate read/write bookkeeping;
-- two `pipe2(O_NONBLOCK|O_CLOEXEC)` pipe pairs, one for each forwarding direction;
-- preconnect userspace buffering, counters and EOF/FIN states;
-- a generation-based event token used with the endpoint lookup table.
+## Data path
 
-A candidate begins `INITIALIZING` and becomes `ACTIVE` only after socket/pipe setup and `epoll` registration succeed. Cleanup moves it to `CLOSING`, removes registration/lookup state, closes every owned descriptor, and releases its backend active count exactly once. Fault injection tests verify partial initialization rollback.
+There are two directions per session:
 
-## 3. Bidirectional `splice()` forwarding
-
+```text
+client fd  -> splice() -> client-to-backend pipe -> splice() -> backend fd
+backend fd -> splice() -> backend-to-client pipe -> splice() -> client fd
 ```
-client socket -> splice(socket, pipe write) -> pipe read -> splice(pipe, socket) -> backend
-backend socket -> splice(socket, pipe write) -> pipe read -> splice(pipe, socket) -> client
-```
 
-`splice()` is Linux-specific, can transfer fewer bytes than requested, and may return `EAGAIN`. The proxy tracks actual bytes in the pipe, and never assumes that one read/write notification implies a complete transfer. The `epoll` write interest is enabled when there are pending bytes and removed after draining. A full direction queue pauses source reads; successful destination progress resumes it.
+Each pipe has a read and write descriptor created with
+`pipe2(O_NONBLOCK | O_CLOEXEC)`. The proxy counts the bytes currently in the
+pipe; it cannot assume `splice()` transferred the requested length.
 
-During a backend handshake, the proxy may stage a limited amount of client bytes via `recv()` and later drain them with `send()`. Therefore *not every byte* necessarily uses zero-copy `splice()`. `splice()` also does not guarantee zero physical CPU or kernel-copy cost on all Linux configurations.
+If `splice()` returns `EAGAIN` when filling a pipe, the source must wait. If a
+pipe-to-socket transfer blocks, its destination needs `EPOLLOUT`. Source reads
+are held back until there is space again. The managed pipe/application queue
+budget is 64 KiB per direction; **that is not a bound on Linux TCP socket
+buffer memory**.
 
-## 4. TCP half-close and completion
+A client can send some bytes while the backend connection is still pending.
+Those bytes go into an 8 KiB preconnect buffer and are drained once `connect()`
+completes. Consequently, "zero-copy" describes the main connected path, not
+literally every byte handled by the process.
 
-TCP is full-duplex: the client may `shutdown(SHUT_WR)` and continue reading while the backend still sends. A source EOF is observed only when a `recv()` or `splice()` indicates no more input. `EPOLLRDHUP` is a notification hint, not permission to drop pending data.
+## FIN, reset, and cleanup
 
-Each direction must drain its staged and pipe-resident data before forwarding FIN with `shutdown(destination, SHUT_WR)`. Connection completion requires **both** directions to finish, not simply the first FIN or HUP event. Abrupt TCP reset (`RST`) is a fatal session error; only that connection is cleaned up.
+TCP's two directions are independent. A `recv()` or `splice()` result of zero
+confirms EOF for a source. An `EPOLLRDHUP` notification is useful, but doesn't
+allow the proxy to discard data still waiting in a pipe. It forwards FIN with
+`shutdown(..., SHUT_WR)` only after that direction has drained.
 
-## 5. Timeouts and operations
+A connection is done normally when both directions have forwarded FIN and no
+pending bytes remain. A reset or unrecoverable socket error follows a separate
+abort path. Cleanup removes the `epoll` registrations, closes the sockets and
+all pipe descriptors, and releases the selected backend's active count once.
+The tests cover partial setup failures, descriptor reuse, half-closes, and RST.
 
-- Backend handshakes have a configurable timeout; idle byte-progress has an independent timeout based on `CLOCK_MONOTONIC`.
-- `epoll_wait()` timeout follows the nearest relevant deadline; deadline expiry cleans up a session without requiring more network traffic.
-- The active connection cap defaults to 10,000 but must be verified against OS limits and actual workload.
-- SIGINT/SIGTERM are consumed via `signalfd`; the listener stops accepting and active sessions are given a configurable drain interval before forced cleanup.
-- Avoid capturing verbose proxy logs to a pipe that no process reads. Under load, a full log pipe can stall the event loop. Tests capture logs to regular files.
+## Backend policy and recovery
 
-## 6. Not included
+Round Robin walks the backend list cyclically. Least Connections counts active
+sessions, including pending upstream handshakes, and rotates tie-breaking
+between equally loaded backends.
 
-IPv6, UDP, TLS termination, HTTP-aware routing, dynamic service discovery, backend weights, application health checks, process supervision, authentication, distributed consensus and automatic replay of failed requests are not implemented. The project demonstrates foundational Linux network and event-loop engineering rather than claiming to be an out-of-the-box production ingress service.
+A refused or timed-out handshake puts the backend in a cooldown. When the
+cooldown expires, a later connection can try it again. This is a lightweight
+passive failure mechanism, **not** continuous health monitoring. The proxy does
+not replay an interrupted TCP stream to another backend: an upstream may have
+already consumed and acted on part of the request.
+
+## Timers and shutdown
+
+Deadlines are based on `CLOCK_MONOTONIC`, not wall-clock time. The next deadline
+also determines the timeout passed to `epoll_wait()`, allowing idle sessions and
+stalled handshakes to expire without extra timer threads.
+
+SIGINT and SIGTERM arrive through `signalfd`. Once shutdown begins, the listener
+stops accepting clients. Existing sessions can finish during the configured
+grace period; anything left at the deadline is closed. This keeps signal
+handling in the ordinary event-loop code rather than touching connection memory
+from an asynchronous signal handler.
+
+## Things I would revisit
+
+- Split the monolithic `src/main.c` into smaller modules.
+- Add IPv6 and an explicit configuration file, if needed.
+- Use an independent backend-health monitor only if the target deployment
+  needs more than passive handshake failures.
+- Benchmark on separate machines with a realistic network and backend rather
+  than treating localhost numbers as universal.
